@@ -1,5 +1,7 @@
 import os
 import time
+import socket
+import ssl
 import urllib.request
 import urllib.error
 from fastapi import FastAPI, HTTPException, Query, Request, Response
@@ -23,10 +25,16 @@ app.add_middleware(
 
 cache: dict[str, dict] = {}
 
-def get_stream_data(video_id: str):
-    cached = cache.get(video_id)
-    if cached and time.time() - cached["cached_at"] < 3600 * 2:
-        return cached["data"]
+# SSL context that avoids Windows OpenSSL handshake freezes on dynamic CDN nodes
+ssl_context = ssl.create_default_context()
+ssl_context.check_hostname = False
+ssl_context.verify_mode = ssl.CERT_NONE
+
+def get_stream_data(video_id: str, force_refresh = False):
+    if not force_refresh:
+        cached = cache.get(video_id)
+        if cached and time.time() - cached["cached_at"] < 3600 * 2:
+            return cached["data"]
 
     url = f"https://www.youtube.com/watch?v={video_id}"
     last_err = None
@@ -78,7 +86,7 @@ def get_stream_data(video_id: str):
 @app.get("/")
 @app.get("/health")
 def health_check():
-    return {"status": "ok new", "service": "cloudio-resolver", "version": "1.0.0"}
+    return {"status": "ok", "service": "cloudio-resolver", "version": "1.0.0"}
 
 @app.api_route("/resolve", methods=["GET", "HEAD"])
 def resolve_stream(id: str = Query(..., description="YouTube video ID")):
@@ -92,24 +100,43 @@ def proxy_audio_stream(request: Request, id: str = Query(..., description="YouTu
     if not id or len(id.strip()) == 0:
         raise HTTPException(status_code=400, detail="Missing or invalid video ID")
     video_id = id.strip()
+
     data = get_stream_data(video_id)
     stream_url = data["url"]
 
-    req = urllib.request.Request(
-        stream_url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
-            "Accept": "*/*",
-        },
-    )
     range_header = request.headers.get("range")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
+        "Accept": "*/*",
+    }
     if range_header:
-        req.add_header("Range", range_header)
+        headers["Range"] = range_header
 
-    try:
-        upstream = urllib.request.urlopen(req, timeout=30)
-    except urllib.error.HTTPError as err:
-        upstream = err
+    upstream = None
+    last_exc = None
+
+    # Connect with up to 3 retries and automatic cache refresh on dead CDN URL
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(stream_url, headers=headers)
+            upstream = urllib.request.urlopen(req, timeout=15, context=ssl_context)
+            break
+        except urllib.error.HTTPError as err:
+            upstream = err
+            break
+        except Exception as exc:
+            last_exc = exc
+            # If initial URL failed, re-resolve with fresh stream URL
+            if attempt == 1:
+                try:
+                    data = get_stream_data(video_id, force_refresh=True)
+                    stream_url = data["url"]
+                except Exception:
+                    pass
+            time.sleep(0.3)
+
+    if upstream is None:
+        raise HTTPException(status_code=502, detail=f"Failed to connect to audio CDN: {last_exc}")
 
     resp_headers = {
         "Content-Type": upstream.headers.get("Content-Type", "audio/mp4"),
@@ -129,12 +156,18 @@ def proxy_audio_stream(request: Request, id: str = Query(..., description="YouTu
     def body_generator():
         try:
             while True:
-                chunk = upstream.read(65536)
+                try:
+                    chunk = upstream.read(65536)
+                except (socket.timeout, TimeoutError, OSError):
+                    break
                 if not chunk:
                     break
                 yield chunk
         finally:
-            upstream.close()
+            try:
+                upstream.close()
+            except Exception:
+                pass
 
     status_code = getattr(upstream, "status", 200)
     return StreamingResponse(
