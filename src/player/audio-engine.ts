@@ -155,6 +155,8 @@ function getStreamUrl(track: Track): string {
 }
 
 let isPrefetchingAutoplay = false;
+let hasPrefetchedForCurrentTrack = false;
+let nextTrackPreloader: HTMLAudioElement | null = null;
 
 /** Pre-cache next track stream metadata and proactively replenish autoplay queue */
 export async function prefetchNextTrack() {
@@ -163,12 +165,26 @@ export async function prefetchNextTrack() {
 
   const nextIndex = (currentIndex ?? 0) + 1;
 
-  // 1. If there is an immediate next track in the queue, pre-cache its stream URL
+  // 1. If there is an immediate next track in the queue, pre-cache its stream URL & warm resolver
   if (nextIndex < queue.length) {
     const nextTrack = queue[nextIndex];
     if (nextTrack) {
       try {
+        // Trigger server-side resolver pre-resolution so pytubefix runs ahead of time!
         fetch(`/api/stream/${encodeURIComponent(nextTrack.id)}`).catch(() => {});
+
+        // Preload next track in background audio element so bytes are ready in memory
+        if (typeof window !== "undefined") {
+          const streamUrl = getStreamUrl(nextTrack);
+          if (!nextTrackPreloader) {
+            nextTrackPreloader = new Audio();
+            nextTrackPreloader.preload = "auto";
+            nextTrackPreloader.muted = true;
+          }
+          if (nextTrackPreloader.src !== streamUrl) {
+            nextTrackPreloader.src = streamUrl;
+          }
+        }
       } catch {
         // non-critical
       }
@@ -445,8 +461,14 @@ export function initAudioEngine() {
         ? store.currentTrack.duration
         : store.duration;
 
-    // Auto-advance: If playback reaches or exceeds song duration, immediately transition to next track
-    if (effectiveDuration > 0 && audio.currentTime >= effectiveDuration) {
+    // Proactive background pre-warm: resolve next track ~25s before end so track switch is instant (<50ms)
+    if (effectiveDuration > 20 && effectiveDuration - audio.currentTime <= 25 && !hasPrefetchedForCurrentTrack) {
+      hasPrefetchedForCurrentTrack = true;
+      prefetchNextTrack().catch(() => {});
+    }
+
+    // Safety net auto-advance only if ended event fails to fire after 1.5s past duration
+    if (effectiveDuration > 0 && audio.currentTime >= effectiveDuration + 1.5) {
       handleTrackEnded();
       return;
     }
@@ -487,11 +509,8 @@ export function initAudioEngine() {
     const store = usePlayerStore.getState();
     if (store.isPlaying && audio.paused) {
       audio.play().catch((err) => {
-        if (err?.name === "NotAllowedError") {
-          usePlayerStore.setState({ isPlaying: false, status: "PAUSED" });
-        } else {
-          console.warn("[AudioEngine] Play on canplay rejected:", err);
-        }
+        // Do not force isPlaying: false on mobile lock-screen
+        console.warn("[AudioEngine] Play on canplay deferred:", err?.message || err);
       });
     }
   });
@@ -580,6 +599,7 @@ export function initAudioEngine() {
     // Track changed → load stream directly
     if (state.currentTrack?.id !== currentTrackId && state.currentTrack) {
       currentTrackId = state.currentTrack.id;
+      hasPrefetchedForCurrentTrack = false;
 
       usePlayerStore.getState().setStatus("LOADING");
       usePlayerStore.getState().setBuffering(true);
@@ -600,10 +620,9 @@ export function initAudioEngine() {
 
       if (!currentSrc || (!isMatchingRemote && !isMatchingBlob)) {
         audio.src = streamUrl;
-        audio.load();
       }
 
-      if (state.isPlaying && audio.paused) {
+      if (state.isPlaying) {
         audio.play().catch((err) => {
           console.warn("[AudioEngine] Autoplay delayed, awaiting buffer or touch:", err.message);
           // Do NOT force status to PAUSED — leave in LOADING/BUFFERING
