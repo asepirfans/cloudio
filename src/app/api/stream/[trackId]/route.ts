@@ -25,12 +25,8 @@ async function getStreamUrlForYtm(videoId: string, forceRefresh = false): Promis
     return { url: cached.url, duration: cached.duration };
   }
 
-  // 1. Primary: Python FastAPI resolver service (custom RESOLVER_SERVICE_URL, Vercel Serverless, or local port 8000)
-  const vercelHost = process.env.VERCEL_PROJECT_PRODUCTION_URL || process.env.VERCEL_URL;
-  const defaultResolverUrl = vercelHost
-    ? `https://${vercelHost}/api/py`
-    : "http://127.0.0.1:8000";
-  const resolverServiceUrl = (process.env.RESOLVER_SERVICE_URL || defaultResolverUrl).replace(/\/+$/, "");
+  // 1. Primary: Dedicated Python FastAPI resolver service (RESOLVER_SERVICE_URL from tunnel, or local port 8000)
+  const resolverServiceUrl = (process.env.RESOLVER_SERVICE_URL || "http://127.0.0.1:8000").replace(/\/+$/, "");
   if (resolverServiceUrl) {
     try {
       const res = await fetch(`${resolverServiceUrl}/resolve?id=${encodeURIComponent(videoId)}`, {
