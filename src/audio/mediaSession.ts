@@ -46,13 +46,14 @@ export function setupMediaSession(handlers: MediaSessionActionHandlers) {
       }
     });
 
-    navigator.mediaSession.setActionHandler("seekforward", (details) => {
-      handlers.onSeekForward(details.seekOffset ?? 10);
-    });
-
-    navigator.mediaSession.setActionHandler("seekbackward", (details) => {
-      handlers.onSeekBackward(details.seekOffset ?? 10);
-    });
+    // Explicitly nullify seekforward and seekbackward so iOS Safari / WebKit lock screen
+    // displays the standard [⏮ Previous Track] and [⏭ Next Track] buttons instead of the circular +/- 10s buttons!
+    try {
+      navigator.mediaSession.setActionHandler("seekforward", null);
+      navigator.mediaSession.setActionHandler("seekbackward", null);
+    } catch {
+      // ignore
+    }
 
     try {
       navigator.mediaSession.setActionHandler("stop", () => {

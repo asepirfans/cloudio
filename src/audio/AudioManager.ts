@@ -159,12 +159,12 @@ export class AudioManager {
       const curTime = this.audio.currentTime;
       const effectiveDuration = this.getEffectiveDuration();
 
-      // Next-track prewarming: 20-30s before track ends
+      // Next-track prewarming: 45s before track ends
       const remaining = effectiveDuration - curTime;
       if (
         Number.isFinite(remaining) &&
-        effectiveDuration > 25 &&
-        remaining <= 25 &&
+        effectiveDuration > 20 &&
+        remaining <= 45 &&
         !this.nextTrackPrepared
       ) {
         this.nextTrackPrepared = true;
@@ -245,14 +245,18 @@ export class AudioManager {
         return;
       }
 
-      this.syncStore({ status: "ERROR", isBuffering: false });
-
-      // Automatically advance to next track after 1.5s failure delay
-      setTimeout(() => {
-        if (!this.audio.paused && this.shouldBePlaying) return;
-        audioLogger.warn("Skipping to next track after stream failure...");
+      // Automatically advance to next track after failure
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        // In background / lock screen, skip immediately without waiting for setTimeout throttling
+        audioLogger.warn("Stream error in background, advancing immediately to keep audio session alive...");
         this.next();
-      }, 1500);
+      } else {
+        setTimeout(() => {
+          if (!this.audio.paused && this.shouldBePlaying) return;
+          audioLogger.warn("Skipping to next track after stream failure...");
+          this.next();
+        }, 1000);
+      }
     });
   }
 
