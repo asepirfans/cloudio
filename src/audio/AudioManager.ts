@@ -121,6 +121,7 @@ export class AudioManager {
       audioLogger.log(`Track started: ${this.currentTrack?.id || "unknown"}`);
       this.syncStore({ isPlaying: true, status: "PLAYING", isBuffering: false });
       setMediaSessionPlaybackState("playing");
+      this.rebindMediaSessionActions();
       this.saveResumeState(true);
     });
 
@@ -128,6 +129,7 @@ export class AudioManager {
       this.shouldBePlaying = true;
       this.syncStore({ isPlaying: true, status: "PLAYING", isBuffering: false });
       setMediaSessionPlaybackState("playing");
+      this.rebindMediaSessionActions();
     });
 
     this.audio.addEventListener("pause", () => {
@@ -303,6 +305,18 @@ export class AudioManager {
       },
       onStop: () => this.pause(),
     });
+  }
+
+  private rebindMediaSessionActions() {
+    if (typeof window === "undefined" || !("mediaSession" in navigator)) return;
+    try {
+      navigator.mediaSession.setActionHandler("nexttrack", () => this.next());
+      navigator.mediaSession.setActionHandler("previoustrack", () => this.previous());
+      navigator.mediaSession.setActionHandler("seekforward", null);
+      navigator.mediaSession.setActionHandler("seekbackward", null);
+    } catch {
+      // ignore
+    }
   }
 
   // ─── Playback Controls ───────────────────────────────────────────────────
