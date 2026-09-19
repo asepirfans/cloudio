@@ -31,21 +31,37 @@ def get_stream_data(video_id: str):
     url = f"https://www.youtube.com/watch?v={video_id}"
     last_err = None
 
-    for client_name in ["ANDROID", "IOS", "MWEB", "WEB"]:
+    # Prioritize MWEB: YouTube returns clean audio/mp4 (AAC) without SABR/UMP packet format
+    for client_name in ["MWEB", "ANDROID", "IOS", "WEB"]:
         try:
             yt = YouTube(url, client=client_name)
-            stream = (
-                yt.streams.get_by_itag(140)
-                or yt.streams.get_by_itag(139)
-                or yt.streams.filter(only_audio=True, mime_type="audio/mp4").first()
-                or yt.streams.get_audio_only()
-            )
+            candidates = [
+                yt.streams.get_by_itag(140),
+                yt.streams.get_by_itag(139),
+                yt.streams.filter(only_audio=True, mime_type="audio/mp4").first(),
+                yt.streams.filter(only_audio=True).first(),
+                yt.streams.get_audio_only(),
+            ]
 
-            if stream and stream.url:
+            for stream in candidates:
+                if stream and stream.url and "sabr=1" not in stream.url:
+                    result = {
+                        "url": stream.url,
+                        "mimeType": stream.mime_type or "audio/mp4",
+                        "itag": stream.itag,
+                        "title": yt.title,
+                        "duration": yt.length,
+                    }
+                    cache[video_id] = {"data": result, "cached_at": time.time()}
+                    return result
+
+            # Fallback if all streams had sabr
+            fallback = yt.streams.get_by_itag(140) or yt.streams.get_audio_only()
+            if fallback and fallback.url:
                 result = {
-                    "url": stream.url,
-                    "mimeType": stream.mime_type or "audio/mp4",
-                    "itag": stream.itag,
+                    "url": fallback.url,
+                    "mimeType": fallback.mime_type or "audio/mp4",
+                    "itag": fallback.itag,
                     "title": yt.title,
                     "duration": yt.length,
                 }
@@ -62,7 +78,7 @@ def get_stream_data(video_id: str):
 @app.get("/")
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "service": "cloudio-resolver", "version": "1.0.0"}
+    return {"status": "ok new", "service": "cloudio-resolver", "version": "1.0.0"}
 
 @app.api_route("/resolve", methods=["GET", "HEAD"])
 def resolve_stream(id: str = Query(..., description="YouTube video ID")):
