@@ -83,6 +83,11 @@ export const usePlayerStore = create<PlayerState>()(
             if (current.currentTrack?.id === track.id && recs.length > 0) {
               const filtered = recs.filter((t) => t.id !== track.id);
               set({ queue: [track, ...filtered] });
+              if (typeof window !== "undefined") {
+                import("@/player/audio-engine").then(({ prefetchNextTrack }) => {
+                  prefetchNextTrack().catch(() => {});
+                });
+              }
             }
           }
         } catch (err) {

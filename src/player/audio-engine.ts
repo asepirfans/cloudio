@@ -146,17 +146,23 @@ function syncMediaSessionPosition() {
 
 // ─── Stream Resolution ────────────────────────────────────────────────────
 
+const preloadedBlobUrls = new Map<string, string>();
+
 function getStreamUrl(track: Track): string {
   const offlineUrl = getSyncOfflineTrackUrl(track.id);
   if (offlineUrl) {
     return offlineUrl;
+  }
+  const preloadedUrl = preloadedBlobUrls.get(track.id);
+  if (preloadedUrl) {
+    return preloadedUrl;
   }
   return `/api/stream/${encodeURIComponent(track.id)}?audio=true`;
 }
 
 let isPrefetchingAutoplay = false;
 let hasPrefetchedForCurrentTrack = false;
-let nextTrackPreloader: HTMLAudioElement | null = null;
+let isBufferingNextTrackBlob = false;
 
 /** Pre-cache next track stream metadata and proactively replenish autoplay queue */
 export async function prefetchNextTrack() {
@@ -165,28 +171,43 @@ export async function prefetchNextTrack() {
 
   const nextIndex = (currentIndex ?? 0) + 1;
 
-  // 1. If there is an immediate next track in the queue, pre-cache its stream URL & warm resolver
+  // 1. If there is an immediate next track in the queue, pre-buffer its audio in RAM so lock-screen transition is 0ms
   if (nextIndex < queue.length) {
     const nextTrack = queue[nextIndex];
-    if (nextTrack) {
+    if (nextTrack && !preloadedBlobUrls.has(nextTrack.id) && !isTrackOffline(nextTrack.id) && !isBufferingNextTrackBlob) {
+      isBufferingNextTrackBlob = true;
       try {
-        // Trigger server-side resolver pre-resolution so pytubefix runs ahead of time!
+        // Trigger server-side resolver pre-resolution so pytubefix runs ahead of time
         fetch(`/api/stream/${encodeURIComponent(nextTrack.id)}`).catch(() => {});
 
-        // Preload next track in background audio element so bytes are ready in memory
-        if (typeof window !== "undefined") {
-          const streamUrl = getStreamUrl(nextTrack);
-          if (!nextTrackPreloader) {
-            nextTrackPreloader = new Audio();
-            nextTrackPreloader.preload = "auto";
-            nextTrackPreloader.muted = true;
-          }
-          if (nextTrackPreloader.src !== streamUrl) {
-            nextTrackPreloader.src = streamUrl;
-          }
-        }
+        // Proactively download audio stream into in-memory Blob while current track is actively playing!
+        // When current track ends on lock screen, this Blob URL plays in 0ms without waiting for network!
+        const audioStreamUrl = `/api/stream/${encodeURIComponent(nextTrack.id)}?audio=true`;
+        fetch(audioStreamUrl)
+          .then((res) => {
+            if (res.ok) return res.blob();
+            throw new Error(`Audio stream prefetch status: ${res.status}`);
+          })
+          .then((blob) => {
+            // Clean up old preloaded blobs to free device RAM
+            for (const [id, url] of preloadedBlobUrls.entries()) {
+              if (id !== nextTrack.id && id !== currentTrack?.id) {
+                URL.revokeObjectURL(url);
+                preloadedBlobUrls.delete(id);
+              }
+            }
+            const blobUrl = URL.createObjectURL(blob);
+            preloadedBlobUrls.set(nextTrack.id, blobUrl);
+            console.log(`[AudioEngine] Pre-buffered in-memory audio ready for: ${nextTrack.title} (${Math.round(blob.size / 1024)} KB)`);
+          })
+          .catch((err) => {
+            console.warn("[AudioEngine] Background stream pre-buffering:", err?.message || err);
+          })
+          .finally(() => {
+            isBufferingNextTrackBlob = false;
+          });
       } catch {
-        // non-critical
+        isBufferingNextTrackBlob = false;
       }
     }
   }
@@ -459,6 +480,7 @@ export function initAudioEngine() {
 
         const streamUrl = getStreamUrl(nextTrack);
         audio.src = streamUrl;
+        audio.load();
         const playPromise = audio.play();
         if (playPromise !== undefined) {
           playPromise.catch((err) => {

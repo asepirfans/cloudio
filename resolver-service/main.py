@@ -4,10 +4,18 @@ import socket
 import ssl
 import urllib.request
 import urllib.error
+import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pytubefix import YouTube
+
+# Force IPv4 to prevent Windows/ISP IPv6 TLS handshake timeouts on Google Video CDN
+old_getaddrinfo = socket.getaddrinfo
+def getaddrinfo_ipv4(*args, **kwargs):
+    responses = old_getaddrinfo(*args, **kwargs)
+    return [r for r in responses if r[0] == socket.AF_INET] or responses
+socket.getaddrinfo = getaddrinfo_ipv4
 
 app = FastAPI(
     title="Cloudio Audio Stream Resolver",
@@ -95,8 +103,16 @@ def resolve_stream(id: str = Query(..., description="YouTube video ID")):
     video_id = id.strip()
     return get_stream_data(video_id)
 
+# Global Async HTTP client with connection pooling for high concurrency
+http_client = httpx.AsyncClient(
+    timeout=httpx.Timeout(connect=15.0, read=60.0, write=15.0, pool=15.0),
+    limits=httpx.Limits(max_keepalive_connections=100, max_connections=500),
+    verify=False,
+    follow_redirects=True,
+)
+
 @app.api_route("/stream", methods=["GET", "HEAD"])
-def proxy_audio_stream(request: Request, id: str = Query(..., description="YouTube video ID")):
+async def proxy_audio_stream(request: Request, id: str = Query(..., description="YouTube video ID")):
     if not id or len(id.strip()) == 0:
         raise HTTPException(status_code=400, detail="Missing or invalid video ID")
     video_id = id.strip()
@@ -105,74 +121,66 @@ def proxy_audio_stream(request: Request, id: str = Query(..., description="YouTu
     stream_url = data["url"]
 
     range_header = request.headers.get("range")
-    headers = {
+    req_headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
         "Accept": "*/*",
     }
     if range_header:
-        headers["Range"] = range_header
+        req_headers["Range"] = range_header
 
     upstream = None
     last_exc = None
 
-    # Connect with up to 3 retries and automatic cache refresh on dead CDN URL
     for attempt in range(3):
         try:
-            req = urllib.request.Request(stream_url, headers=headers)
-            upstream = urllib.request.urlopen(req, timeout=15, context=ssl_context)
-            break
-        except urllib.error.HTTPError as err:
-            upstream = err
-            break
+            req = http_client.build_request("GET", stream_url, headers=req_headers)
+            upstream = await http_client.send(req, stream=True)
+            if upstream.status_code in [200, 206]:
+                break
+            # If CDN returns non-success (e.g. 403 expired), refresh link
+            await upstream.aclose()
+            if attempt < 2:
+                data = get_stream_data(video_id, force_refresh=True)
+                stream_url = data["url"]
         except Exception as exc:
             last_exc = exc
-            # If initial URL failed, re-resolve with fresh stream URL
-            if attempt == 1:
+            if attempt < 2:
                 try:
                     data = get_stream_data(video_id, force_refresh=True)
                     stream_url = data["url"]
                 except Exception:
                     pass
-            time.sleep(0.3)
 
-    if upstream is None:
+    if upstream is None or upstream.is_closed:
         raise HTTPException(status_code=502, detail=f"Failed to connect to audio CDN: {last_exc}")
 
     resp_headers = {
-        "Content-Type": upstream.headers.get("Content-Type", "audio/mp4"),
+        "Content-Type": upstream.headers.get("content-type", "audio/mp4"),
         "Accept-Ranges": "bytes",
         "Access-Control-Allow-Origin": "*",
-        "Cache-Control": "public, max-age=3600",
+        "Cache-Control": "public, max-age=86400, s-maxage=86400",
     }
-    if upstream.headers.get("Content-Range"):
-        resp_headers["Content-Range"] = upstream.headers.get("Content-Range")
-    if upstream.headers.get("Content-Length"):
-        resp_headers["Content-Length"] = upstream.headers.get("Content-Length")
+    if "content-range" in upstream.headers:
+        resp_headers["Content-Range"] = upstream.headers["content-range"]
+    if "content-length" in upstream.headers:
+        resp_headers["Content-Length"] = upstream.headers["content-length"]
 
     if request.method == "HEAD":
-        upstream.close()
-        return Response(status_code=getattr(upstream, "status", 200), headers=resp_headers)
+        await upstream.aclose()
+        return Response(status_code=upstream.status_code, headers=resp_headers)
 
-    def body_generator():
+    async def body_generator():
         try:
-            while True:
-                try:
-                    chunk = upstream.read(65536)
-                except (socket.timeout, TimeoutError, OSError):
-                    break
-                if not chunk:
-                    break
+            async for chunk in upstream.aiter_bytes(chunk_size=65536):
                 yield chunk
+        except Exception:
+            pass
         finally:
-            try:
-                upstream.close()
-            except Exception:
-                pass
+            await upstream.aclose()
 
-    status_code = getattr(upstream, "status", 200)
     return StreamingResponse(
         body_generator(),
-        status_code=status_code,
+        status_code=upstream.status_code,
         headers=resp_headers,
     )
 

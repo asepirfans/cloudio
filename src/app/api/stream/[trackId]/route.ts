@@ -1,10 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { audiusProvider } from "@/music/audius/provider";
-import { execFile } from "child_process";
-import { promisify } from "util";
-import path from "path";
 
-const execFileAsync = promisify(execFile);
 
 export const runtime = "nodejs";
 
@@ -20,12 +16,10 @@ const streamCache = new Map<string, CachedStream>();
 
 async function getStreamUrlForYtm(videoId: string, forceRefresh = false): Promise<{ url: string; duration?: number } | null> {
   const cached = streamCache.get(videoId);
-  // Cache for 2 hours (Googlevideo URLs typically expire in 6 hours)
   if (!forceRefresh && cached && Date.now() - cached.cachedAt < 2 * 60 * 60 * 1000) {
     return { url: cached.url, duration: cached.duration };
   }
 
-  // 1. Primary: Dedicated Python FastAPI resolver service (RESOLVER_SERVICE_URL from tunnel, or local port 8000)
   const resolverServiceUrl = (process.env.RESOLVER_SERVICE_URL || "http://127.0.0.1:8000").replace(/\/+$/, "");
   if (resolverServiceUrl) {
     try {
@@ -50,33 +44,6 @@ async function getStreamUrlForYtm(videoId: string, forceRefresh = false): Promis
     } catch (err) {
       console.error("[getStreamUrlForYtm] Python resolver error:", err);
     }
-  }
-
-  // 2. Fallback: Local Python script execution via pytubefix
-  const pythonBin =
-    process.env.PYTHON_BIN ||
-    (process.platform === "win32"
-      ? "C:\\Users\\SAMJIN\\AppData\\Local\\Programs\\Python\\Python39\\python.exe"
-      : "python3");
-  const scriptPath = path.join(process.cwd(), "scripts", "resolve_stream.py");
-
-  try {
-    const { stdout } = await execFileAsync(pythonBin, [scriptPath, videoId], {
-      timeout: 15000,
-    });
-    const parsed = JSON.parse(stdout);
-    if (parsed.url) {
-      streamCache.set(videoId, {
-        url: parsed.url,
-        mimeType: parsed.mimeType || "audio/mp4",
-        itag: parsed.itag || 140,
-        duration: parsed.duration,
-        cachedAt: Date.now(),
-      });
-      return { url: parsed.url, duration: parsed.duration };
-    }
-  } catch (err) {
-    console.error("[getStreamUrlForYtm] Local Python script error for", videoId, err);
   }
 
   return null;
@@ -105,31 +72,8 @@ export async function GET(
   const forceRefresh = searchParams.get("refresh") === "1";
 
   try {
-    let streamUrl: string | null = null;
-    let trackDuration: number | undefined = undefined;
-
-    if (provider === "ytm") {
-      const resolved = await getStreamUrlForYtm(providerTrackId, forceRefresh);
-      streamUrl = resolved?.url || null;
-      trackDuration = resolved?.duration;
-    } else if (provider === "audius") {
-      const source = await audiusProvider.getStream(providerTrackId);
-      streamUrl = source?.url || null;
-    }
-
-    if (!streamUrl) {
-      return NextResponse.json({ error: "Stream unavailable" }, { status: 404 });
-    }
-
-    // Direct audio streaming proxy (handles HTTP Range requests with status 206 Partial Content)
+    // 1. Direct audio streaming proxy (handles HTTP Range requests with status 206 Partial Content)
     if (searchParams.get("audio") === "true" || searchParams.get("play") === "true") {
-      // If external resolver microservice (e.g. Cloudflare Tunnel to residential PC) is configured,
-      // redirect client directly to the resolver's streaming proxy so Vercel datacenter IP never touches Googlevideo (preventing 403 Forbidden)!
-      if (provider === "ytm" && process.env.RESOLVER_SERVICE_URL) {
-        const resolverBase = process.env.RESOLVER_SERVICE_URL.replace(/\/+$/, "");
-        return NextResponse.redirect(`${resolverBase}/stream?id=${encodeURIComponent(providerTrackId)}`);
-      }
-
       const range = req.headers.get("range");
       const forwardHeaders: Record<string, string> = {
         "User-Agent":
@@ -140,19 +84,45 @@ export async function GET(
         forwardHeaders["Range"] = range;
       }
 
-      let streamRes = await fetch(streamUrl, {
+      let streamFetchUrl: string | null = null;
+
+
+      const resolverBase = (process.env.RESOLVER_SERVICE_URL || "http://127.0.0.1:8000").replace(/\/+$/, "");
+      if (provider === "ytm" && resolverBase) {
+        streamFetchUrl = `${resolverBase}/stream?id=${encodeURIComponent(providerTrackId)}`;
+      } else {
+        let streamUrl: string | null = null;
+        if (provider === "ytm") {
+          const resolved = await getStreamUrlForYtm(providerTrackId, forceRefresh);
+          streamUrl = resolved?.url || null;
+        } else if (provider === "audius") {
+          const source = await audiusProvider.getStream(providerTrackId);
+          streamUrl = source?.url || null;
+        }
+
+        if (!streamUrl) {
+          return NextResponse.json({ error: "Stream unavailable" }, { status: 404 });
+        }
+        streamFetchUrl = streamUrl;
+      }
+
+      let streamRes = await fetch(streamFetchUrl, {
         headers: forwardHeaders,
       });
 
-      // Upstream recovery: If Googlevideo returns 403 Forbidden or expired token, clear cache and re-resolve once
+      // Upstream recovery: If audio fetch failed, clear cache and retry once with force-refresh
       if (!streamRes.ok && streamRes.status !== 206 && provider === "ytm") {
-        console.warn(`[API /stream] Upstream audio fetch failed (${streamRes.status}), re-resolving with force-refresh...`);
+        console.warn(`[API /stream] Upstream audio fetch failed (${streamRes.status}), retrying...`);
         streamCache.delete(providerTrackId);
-        const retryResolved = await getStreamUrlForYtm(providerTrackId, true);
-        if (retryResolved?.url) {
-          streamUrl = retryResolved.url;
-          streamRes = await fetch(streamUrl, { headers: forwardHeaders });
+        if (resolverBase) {
+          streamFetchUrl = `${resolverBase}/stream?id=${encodeURIComponent(providerTrackId)}`;
+        } else {
+          const retryResolved = await getStreamUrlForYtm(providerTrackId, true);
+          if (retryResolved?.url) {
+            streamFetchUrl = retryResolved.url;
+          }
         }
+        streamRes = await fetch(streamFetchUrl, { headers: forwardHeaders });
       }
 
       const responseHeaders = new Headers();
@@ -174,7 +144,23 @@ export async function GET(
       });
     }
 
-    // Metadata response: points client HTML5 audio element to our direct streaming proxy
+    // 2. Metadata / pre-warm response: resolves stream URL and returns JSON
+    let streamUrl: string | null = null;
+    let trackDuration: number | undefined = undefined;
+
+    if (provider === "ytm") {
+      const resolved = await getStreamUrlForYtm(providerTrackId, forceRefresh);
+      streamUrl = resolved?.url || null;
+      trackDuration = resolved?.duration;
+    } else if (provider === "audius") {
+      const source = await audiusProvider.getStream(providerTrackId);
+      streamUrl = source?.url || null;
+    }
+
+    if (!streamUrl) {
+      return NextResponse.json({ error: "Stream unavailable" }, { status: 404 });
+    }
+
     return NextResponse.json({
       source: {
         url: `/api/stream/${encodeURIComponent(decoded)}?audio=true`,
