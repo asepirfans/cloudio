@@ -440,6 +440,34 @@ export function initAudioEngine() {
       return;
     }
 
+    // Keep MediaSession playbackState alive across track boundary so mobile OS does not kill background execution
+    if (typeof window !== "undefined" && "mediaSession" in navigator) {
+      navigator.mediaSession.playbackState = "playing";
+    }
+
+    const { queue, currentIndex, shuffle } = store;
+    const sourceQueue = queue;
+    const nextIndex = currentIndex + 1;
+
+    // Direct synchronous chaining inside the native ended event (Crucial for iOS WebKit & Android lock screen continuity)
+    if (nextIndex < sourceQueue.length) {
+      const nextTrack = sourceQueue[nextIndex];
+      if (nextTrack) {
+        currentTrackId = nextTrack.id;
+        hasPrefetchedForCurrentTrack = false;
+        updateMediaSession(nextTrack);
+
+        const streamUrl = getStreamUrl(nextTrack);
+        audio.src = streamUrl;
+        const playPromise = audio.play();
+        if (playPromise !== undefined) {
+          playPromise.catch((err) => {
+            console.warn("[AudioEngine] Background transition play deferred:", err);
+          });
+        }
+      }
+    }
+
     usePlayerStore.getState().next();
   };
 
@@ -526,14 +554,19 @@ export function initAudioEngine() {
   });
 
   audio.addEventListener("pause", () => {
-    const { status } = usePlayerStore.getState();
-    if (status !== "ENDED" && status !== "RESOLVING" && status !== "LOADING") {
-      usePlayerStore.getState().setStatus("PAUSED");
+    const { status, isPlaying } = usePlayerStore.getState();
+    // Only mark paused if the player store actually intended to pause (user clicked Pause)
+    // When a track finishes, the browser temporarily fires 'pause' before 'ended' or before next src.
+    // If we mark mediaSession.playbackState = 'paused' here, the mobile OS instantly kills the background audio session!
+    if (!isPlaying) {
+      if (status !== "ENDED" && status !== "RESOLVING" && status !== "LOADING") {
+        usePlayerStore.getState().setStatus("PAUSED");
+      }
+      if (typeof window !== "undefined" && "mediaSession" in navigator) {
+        navigator.mediaSession.playbackState = "paused";
+      }
+      saveCurrentResumeState(true);
     }
-    if (typeof window !== "undefined" && "mediaSession" in navigator) {
-      navigator.mediaSession.playbackState = "paused";
-    }
-    saveCurrentResumeState(true);
   });
 
   audio.addEventListener("ended", () => {
