@@ -62,7 +62,6 @@ export class AudioManager {
     } else {
       this.audio = new Audio();
       this.audio.preload = "auto";
-      this.audio.crossOrigin = "anonymous";
       this.audio.setAttribute("playsinline", "true");
       this.audio.setAttribute("webkit-playsinline", "true");
       this.audio.setAttribute("x-webkit-airplay", "allow");
