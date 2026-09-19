@@ -1,7 +1,8 @@
 "use client";
 import Image from "next/image";
-import { Play, Pause } from "lucide-react";
+import { Play, Pause, ListMusic } from "lucide-react";
 import { usePlayerStore } from "@/stores/player-store";
+import { getAudio } from "@/player/audio-engine";
 import { FullPlayer } from "./FullPlayer";
 
 export function MiniPlayer() {
@@ -10,14 +11,27 @@ export function MiniPlayer() {
     isPlaying,
     currentTime,
     duration,
-    togglePlay,
     showFullPlayer,
     setShowFullPlayer,
+    openQueue,
+    queuePulse,
   } = usePlayerStore();
 
   if (!currentTrack) return null;
 
   const progress = duration > 0 ? Math.min(100, Math.max(0, (currentTime / duration) * 100)) : 0;
+
+  const handleTogglePlay = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const audio = getAudio();
+    if (isPlaying) {
+      audio.pause();
+      usePlayerStore.getState().pause();
+    } else {
+      audio.play().catch(() => {});
+      usePlayerStore.getState().play();
+    }
+  };
 
   return (
     <>
@@ -77,13 +91,28 @@ export function MiniPlayer() {
                   </p>
                 </div>
 
-                {/* Play/pause button */}
+                {/* Queue button */}
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
-                    togglePlay();
+                    openQueue();
                   }}
-                  className="touch-target p-2 rounded-full transition-fast shrink-0 text-primary hover:text-accent active:scale-95"
+                  className={`relative p-2 rounded-full transition-all shrink-0 text-white/50 hover:text-white active:scale-95 touch-manipulation cursor-pointer ${
+                    queuePulse ? "text-sky-400 scale-110" : ""
+                  }`}
+                  aria-label="Buka antrean"
+                  title="Buka antrean putar"
+                >
+                  <ListMusic size={20} strokeWidth={1.8} aria-hidden="true" />
+                  {queuePulse && (
+                    <span className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-sky-400 animate-ping" />
+                  )}
+                </button>
+
+                {/* Play/pause button */}
+                <button
+                  onClick={handleTogglePlay}
+                  className="touch-target p-2 rounded-full transition-fast shrink-0 text-primary hover:text-accent active:scale-95 touch-manipulation cursor-pointer"
                   aria-label={isPlaying ? "Pause" : "Play"}
                 >
                   {isPlaying ? (

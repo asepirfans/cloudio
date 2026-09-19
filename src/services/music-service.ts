@@ -1,6 +1,6 @@
 import { ytmProvider } from "@/music/ytm/provider";
 import { audiusProvider } from "@/music/audius/provider";
-import type { Track, SearchResults } from "@/types/music";
+import type { Track, AlbumDetail, ArtistDetail, SearchResults } from "@/types/music";
 
 /**
  * Music Service — the only interface the UI touches.
@@ -11,7 +11,7 @@ import type { Track, SearchResults } from "@/types/music";
 export const musicService = {
   async search(query: string): Promise<SearchResults> {
     const results = await ytmProvider.searchAll(query);
-    if (results.tracks.length > 0) {
+    if (results.tracks.length > 0 || results.artists.length > 0 || (results.albums && results.albums.length > 0)) {
       return results;
     }
     // Fallback to Audius if YTM returns no tracks
@@ -55,5 +55,21 @@ export const musicService = {
       return audiusProvider.getArtistTracks?.(providerArtistId) ?? [];
     }
     return [];
+  },
+
+  async getAlbum(albumId: string): Promise<AlbumDetail | null> {
+    const [provider, providerAlbumId] = albumId.includes(":") ? albumId.split(":") : ["ytm", albumId];
+    if (provider === "ytm") {
+      return ytmProvider.getAlbum?.(providerAlbumId) ?? null;
+    }
+    return null;
+  },
+
+  async getArtist(artistId: string): Promise<ArtistDetail | null> {
+    const [provider, providerArtistId] = artistId.includes(":") ? artistId.split(":") : ["ytm", artistId];
+    if (provider === "ytm") {
+      return ytmProvider.getArtist?.(providerArtistId) ?? null;
+    }
+    return null;
   },
 };

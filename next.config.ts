@@ -29,7 +29,23 @@ const nextConfig: NextConfig = {
     },
   ],
   // Allow mobile and local network access in development
-  allowedDevOrigins: ["192.168.15.157", "localhost:3000", "127.0.0.1:3000"],
+  allowedDevOrigins: [
+    "192.168.100.242",
+    "192.168.100.242:3000",
+    "192.168.100.227",
+    "192.168.100.227:3000",
+    "192.168.15.157",
+    "localhost:3000",
+  ],
+  rewrites: async () => [
+    {
+      source: "/api/py/:path*",
+      destination:
+        process.env.NODE_ENV === "development"
+          ? "http://127.0.0.1:8000/api/py/:path*"
+          : "/api/index.py",
+    },
+  ],
 };
 
 export default nextConfig;

@@ -52,9 +52,35 @@ export interface Artist {
   followerCount?: number;
 }
 
+export interface ArtistDetail extends Artist {
+  popularTracks: Track[];
+  description?: string;
+  subscriberCount?: string;
+  headerArtworkUrl?: string;
+}
+
+export interface Album {
+  id: string;
+  title: string;
+  artist: string;
+  artistId?: string;
+  artworkUrl?: string;
+  year?: string;
+  trackCount?: number;
+  provider: MusicProviderName;
+  providerAlbumId: string;
+}
+
+export interface AlbumDetail extends Album {
+  tracks: Track[];
+  description?: string;
+}
+
 export interface SearchResults {
   tracks: Track[];
   artists: Artist[];
+  albums?: Album[];
+  isArtistMatch?: boolean;
   total: number;
 }
 
@@ -69,6 +95,12 @@ export interface Lyrics {
   synced?: LyricLine[];
   source?: string;
   language?: string;
+}
+
+export interface QueueToastState {
+  id: number;
+  message: string;
+  trackTitle?: string;
 }
 
 export interface PlayerState {
@@ -87,6 +119,10 @@ export interface PlayerState {
   showFullPlayer: boolean;
   showQueue: boolean;
   showLyrics: boolean;
+  autoplay: boolean;
+  priorityQueueCount: number;
+  toast: QueueToastState | null;
+  queuePulse: boolean;
 
   // Actions
   play: (track?: Track) => void;
@@ -104,11 +140,16 @@ export interface PlayerState {
   clearQueue: () => void;
   playNext: (track: Track) => void;
   toggleShuffle: () => void;
+  toggleAutoplay: () => void;
+  setAutoplay: (autoplay: boolean) => void;
   setRepeatMode: (mode: RepeatMode) => void;
   setShowFullPlayer: (show: boolean) => void;
   setShowQueue: (show: boolean) => void;
   setShowLyrics: (show: boolean) => void;
   setStatus: (status: PlayerStatus) => void;
+  showQueueToast: (message: string, trackTitle?: string) => void;
+  hideQueueToast: () => void;
+  openQueue: () => void;
   setCurrentTime: (time: number) => void;
   setDuration: (duration: number) => void;
   setBuffering: (buffering: boolean) => void;

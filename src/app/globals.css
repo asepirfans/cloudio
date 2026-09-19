@@ -53,6 +53,9 @@
     font-size: 16px;
     -webkit-text-size-adjust: 100%;
     text-size-adjust: 100%;
+    width: 100%;
+    max-width: 100%;
+    overflow-x: hidden !important;
   }
 
   body {
@@ -64,6 +67,10 @@
     -moz-osx-font-smoothing: grayscale;
     overscroll-behavior: none;
     min-height: 100dvh;
+    width: 100%;
+    max-width: 100%;
+    overflow-x: hidden !important;
+    position: relative;
   }
 
   /* Safe area utilities for iPhone */

@@ -34,13 +34,17 @@ export const usePlayerStore = create<PlayerState>()(
       showFullPlayer: false,
       showQueue: false,
       showLyrics: false,
+      autoplay: true,
+      priorityQueueCount: 0,
+      toast: null,
+      queuePulse: false,
 
       play: (track?: Track) => {
         if (track) {
           const { queue } = get();
           const existingIndex = queue.findIndex((t) => t.id === track.id);
           if (existingIndex !== -1) {
-            set({ currentTrack: track, currentIndex: existingIndex, isPlaying: true, status: "RESOLVING" });
+            set({ currentTrack: track, currentIndex: existingIndex, isPlaying: true, status: "RESOLVING", priorityQueueCount: 0 });
           } else {
             set({
               currentTrack: track,
@@ -48,6 +52,7 @@ export const usePlayerStore = create<PlayerState>()(
               currentIndex: 0,
               isPlaying: true,
               status: "RESOLVING",
+              priorityQueueCount: 0,
             });
           }
         } else {
@@ -63,6 +68,7 @@ export const usePlayerStore = create<PlayerState>()(
           currentIndex: 0,
           isPlaying: true,
           status: "RESOLVING",
+          priorityQueueCount: 0,
         });
 
         // Fetch smart radio recommendations based on the song and artist
@@ -93,7 +99,7 @@ export const usePlayerStore = create<PlayerState>()(
       },
 
       next: () => {
-        const { queue, currentIndex, repeatMode, shuffle } = get();
+        const { queue, currentIndex, repeatMode, shuffle, autoplay, currentTrack } = get();
         if (queue.length === 0) return;
 
         if (repeatMode === "track") {
@@ -108,18 +114,56 @@ export const usePlayerStore = create<PlayerState>()(
         if (nextIndex >= sourceQueue.length) {
           if (repeatMode === "queue") {
             set({ currentIndex: 0, currentTrack: sourceQueue[0], isPlaying: true, status: "RESOLVING" });
-          } else {
-            set({ isPlaying: false, status: "ENDED" });
+            return;
           }
+
+          // Autoplay (Infinite Radio): When queue ends, seamlessly fetch and play similar songs based on the last track
+          if (autoplay && currentTrack) {
+            set({ status: "LOADING" });
+            const lastTrack = currentTrack;
+            fetch(
+              `/api/recommendations?trackId=${encodeURIComponent(lastTrack.id)}&artist=${encodeURIComponent(lastTrack.artist)}`
+            )
+              .then((r) => r.json())
+              .then((data) => {
+                const recs: Track[] = data.tracks || [];
+                const current = get();
+                if (recs.length > 0) {
+                  const existingIds = new Set(current.queue.map((t) => t.id));
+                  const filtered = recs.filter((t) => !existingIds.has(t.id));
+                  const toUse = filtered.length > 0 ? filtered : recs.filter((t) => t.id !== lastTrack.id);
+                  if (toUse.length > 0) {
+                    const nextSong = toUse[0];
+                    const newQueue = [...current.queue, ...toUse];
+                    set({
+                      queue: newQueue,
+                      currentIndex: current.queue.length,
+                      currentTrack: nextSong,
+                      isPlaying: true,
+                      status: "RESOLVING",
+                    });
+                    return;
+                  }
+                }
+                set({ isPlaying: false, status: "ENDED" });
+              })
+              .catch(() => {
+                set({ isPlaying: false, status: "ENDED" });
+              });
+            return;
+          }
+
+          set({ isPlaying: false, status: "ENDED" });
           return;
         }
 
-        set({
+        set((s) => ({
           currentIndex: nextIndex,
           currentTrack: sourceQueue[nextIndex],
           isPlaying: true,
           status: "RESOLVING",
-        });
+          priorityQueueCount: Math.max(0, (s.priorityQueueCount || 0) - 1),
+        }));
       },
 
       previous: () => {
@@ -160,6 +204,7 @@ export const usePlayerStore = create<PlayerState>()(
           currentTrack: tracks[startIndex],
           isPlaying: true,
           status: "RESOLVING",
+          priorityQueueCount: 0,
         });
       },
 
@@ -170,21 +215,72 @@ export const usePlayerStore = create<PlayerState>()(
         set((s) => {
           const newQueue = s.queue.filter((_, i) => i !== index);
           const newIndex = index < s.currentIndex ? s.currentIndex - 1 : s.currentIndex;
-          return { queue: newQueue, currentIndex: newIndex };
+          const wasPriority = index > s.currentIndex && index <= s.currentIndex + (s.priorityQueueCount || 0);
+          return {
+            queue: newQueue,
+            currentIndex: newIndex,
+            priorityQueueCount: wasPriority ? Math.max(0, (s.priorityQueueCount || 0) - 1) : s.priorityQueueCount,
+          };
         }),
 
       clearQueue: () =>
         set((s) => ({
           queue: s.currentTrack ? [s.currentTrack] : [],
           currentIndex: 0,
+          priorityQueueCount: 0,
         })),
 
-      playNext: (track: Track) =>
+      playNext: (track: Track) => {
         set((s) => {
-          const after = s.currentIndex + 1;
-          const newQueue = [...s.queue.slice(0, after), track, ...s.queue.slice(after)];
-          return { queue: newQueue };
-        }),
+          if (s.queue.length === 0 || !s.currentTrack) {
+            return {
+              queue: [track],
+              currentIndex: 0,
+              currentTrack: track,
+              priorityQueueCount: 0,
+              queuePulse: true,
+              toast: {
+                id: Date.now(),
+                message: "Diputar di antrean pertama",
+                trackTitle: track.title,
+              },
+            };
+          }
+
+          // Remove any existing duplicate of this track from upcoming queue (after currentIndex)
+          const upcoming = s.queue.slice(s.currentIndex + 1).filter((t) => t.id !== track.id);
+          const historyAndCurrent = s.queue.slice(0, s.currentIndex + 1);
+
+          // Insert after currentTrack + any previous user priority tracks
+          const priorityCount = s.priorityQueueCount || 0;
+          const insertOffset = Math.min(upcoming.length, priorityCount);
+
+          const newUpcoming = [
+            ...upcoming.slice(0, insertOffset),
+            track,
+            ...upcoming.slice(insertOffset),
+          ];
+
+          return {
+            queue: [...historyAndCurrent, ...newUpcoming],
+            priorityQueueCount: priorityCount + 1,
+            queuePulse: true,
+            toast: {
+              id: Date.now(),
+              message: "Ditambahkan ke antrean berikutnya",
+              trackTitle: track.title,
+            },
+          };
+        });
+
+        // Reset pulse after 1.5s
+        setTimeout(() => set({ queuePulse: false }), 1500);
+
+        // Auto dismiss toast after 3.5s
+        setTimeout(() => {
+          set((s) => (s.toast?.id ? { toast: null } : {}));
+        }, 3500);
+      },
 
       toggleShuffle: () =>
         set((s) => {
@@ -194,6 +290,9 @@ export const usePlayerStore = create<PlayerState>()(
           }
           return { shuffle: newShuffle };
         }),
+
+      toggleAutoplay: () => set((s) => ({ autoplay: !s.autoplay })),
+      setAutoplay: (autoplay: boolean) => set({ autoplay }),
 
       setRepeatMode: (mode: RepeatMode) => set({ repeatMode: mode }),
 
@@ -205,6 +304,25 @@ export const usePlayerStore = create<PlayerState>()(
       setCurrentTime: (currentTime: number) => set({ currentTime }),
       setDuration: (duration: number) => set({ duration }),
       setBuffering: (isBuffering: boolean) => set({ isBuffering }),
+
+      showQueueToast: (message: string, trackTitle?: string) => {
+        set({
+          toast: { id: Date.now(), message, trackTitle },
+          queuePulse: true,
+        });
+        setTimeout(() => set({ queuePulse: false }), 1500);
+        setTimeout(() => set((s) => (s.toast?.id ? { toast: null } : {})), 3500);
+      },
+
+      hideQueueToast: () => set({ toast: null }),
+
+      openQueue: () => {
+        set({
+          showLyrics: false,
+          showQueue: true,
+          showFullPlayer: true,
+        });
+      },
     }),
     {
       name: "player-store",
@@ -216,6 +334,8 @@ export const usePlayerStore = create<PlayerState>()(
         isMuted: state.isMuted,
         shuffle: state.shuffle,
         repeatMode: state.repeatMode,
+        autoplay: state.autoplay,
+        priorityQueueCount: state.priorityQueueCount,
       }),
     }
   )

@@ -1,8 +1,10 @@
 "use client";
 
+import { useState } from "react";
 import Image from "next/image";
-import { Play } from "lucide-react";
+import { Play, ListPlus, Check } from "lucide-react";
 import { usePlayerStore } from "@/stores/player-store";
+import { playTrackDirectly } from "@/player/audio-engine";
 import type { Track } from "@/types/music";
 
 interface TrackCardProps {
@@ -11,26 +13,46 @@ interface TrackCardProps {
 }
 
 export function TrackCard({ track, queue }: TrackCardProps) {
-  const { setQueue, play, currentTrack, isPlaying, queue: storeQueue } = usePlayerStore();
+  const [justAdded, setJustAdded] = useState(false);
+  const { currentTrack, isPlaying, playNext, showQueueToast } = usePlayerStore();
   const isActive = currentTrack?.id === track.id;
 
-  const handlePlay = () => {
-    if (isActive) {
-      usePlayerStore.getState().togglePlay();
-      return;
-    }
-    const playQueue = queue ?? storeQueue;
-    const idx = playQueue.findIndex((t) => t.id === track.id);
-    if (idx !== -1) {
-      setQueue(playQueue, idx);
+  const handlePlay = (e?: React.MouseEvent) => {
+    e?.stopPropagation();
+    if (queue && queue.length > 0) {
+      const idx = queue.findIndex((t) => t.id === track.id);
+      playTrackDirectly(track, {
+        queue,
+        index: idx !== -1 ? idx : 0,
+      });
     } else {
-      play(track);
+      playTrackDirectly(track, {
+        useSmartQueue: true,
+      });
     }
+  };
+
+  const handleAddToQueue = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!currentTrack) {
+      playTrackDirectly(track, { queue: [track], index: 0 });
+      showQueueToast("Lagu mulai diputar & antrean aktif", track.title);
+    } else {
+      playNext(track);
+      showQueueToast("Ditambahkan ke antrean berikutnya", track.title);
+    }
+
+    if (typeof navigator !== "undefined" && navigator.vibrate) {
+      try { navigator.vibrate(35); } catch {}
+    }
+
+    setJustAdded(true);
+    setTimeout(() => setJustAdded(false), 1500);
   };
 
   return (
     <div
-      className="w-36 shrink-0 cursor-pointer group"
+      className="w-36 shrink-0 cursor-pointer group touch-manipulation select-none active:scale-[0.98] transition-transform"
       role="button"
       onClick={handlePlay}
       aria-label={`Play ${track.title} by ${track.artist}`}
@@ -50,6 +72,7 @@ export function TrackCard({ track, queue }: TrackCardProps) {
             height={144}
             className="w-full h-full object-cover transition-transform duration-200 group-hover:scale-105"
             unoptimized
+            loading="eager"
             referrerPolicy="no-referrer"
           />
         ) : (
@@ -88,6 +111,31 @@ export function TrackCard({ track, queue }: TrackCardProps) {
             Playing
           </div>
         )}
+
+        {/* Quick Add to Queue button */}
+        <button
+          type="button"
+          onClick={handleAddToQueue}
+          className={`absolute top-2 right-2 z-10 flex items-center gap-1 px-2 py-1 rounded-full transition-all touch-manipulation cursor-pointer active:scale-90 ${
+            justAdded
+              ? "bg-sky-400 text-black shadow-md opacity-100"
+              : "bg-black/60 text-white/90 hover:text-white hover:bg-black/80 backdrop-blur-md opacity-80 md:opacity-0 md:group-hover:opacity-100 border border-white/10"
+          }`}
+          title="Tambahkan ke antrean berikutnya"
+          aria-label={`Tambahkan ${track.title} ke antrean`}
+        >
+          {justAdded ? (
+            <>
+              <Check size={13} className="text-black stroke-[2.5]" />
+              <span className="text-[10px] font-semibold text-black">Antrean</span>
+            </>
+          ) : (
+            <>
+              <ListPlus size={14} />
+              <span className="text-[10px] font-medium hidden md:inline">Antrean</span>
+            </>
+          )}
+        </button>
       </div>
 
       {/* Track info */}

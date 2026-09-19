@@ -78,8 +78,9 @@ export async function GET(req: NextRequest) {
 
     // 2. Secondary / Fallback: Top songs by the same artist
     if (tracks.length < 10 && artist) {
+      const cleanArtist = artist.split(/[(,]|feat\./i)[0].trim();
       try {
-        const artistSearch = await yt.music.search(artist, { type: "song" });
+        const artistSearch = await yt.music.search(cleanArtist || artist, { type: "song" });
         const songs = artistSearch.songs?.contents || [];
         for (const s of songs) {
           const t = normalizeYouTubeMusicTrack(s);
@@ -90,6 +91,23 @@ export async function GET(req: NextRequest) {
         }
       } catch (err) {
         console.warn("[/api/recommendations] artist search fallback failed:", err);
+      }
+    }
+
+    // 3. Guaranteed safety net fallback if still empty
+    if (tracks.length === 0) {
+      try {
+        const fallbackSearch = await yt.music.search("popular hits", { type: "song" });
+        const songs = fallbackSearch.songs?.contents || [];
+        for (const s of songs) {
+          const t = normalizeYouTubeMusicTrack(s);
+          if (!seenIds.has(t.id)) {
+            seenIds.add(t.id);
+            tracks.push(t);
+          }
+        }
+      } catch (err) {
+        console.warn("[/api/recommendations] global fallback failed:", err);
       }
     }
 

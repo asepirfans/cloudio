@@ -25,7 +25,43 @@ async function getStreamUrlForYtm(videoId: string, forceRefresh = false): Promis
     return { url: cached.url, duration: cached.duration };
   }
 
-  const pythonBin = "C:\\Users\\SAMJIN\\AppData\\Local\\Programs\\Python\\Python39\\python.exe";
+  // 1. Primary: Python FastAPI resolver service (custom RESOLVER_SERVICE_URL, Vercel Serverless, or local port 8000)
+  const vercelHost = process.env.VERCEL_PROJECT_PRODUCTION_URL || process.env.VERCEL_URL;
+  const defaultResolverUrl = vercelHost
+    ? `https://${vercelHost}/api/py`
+    : "http://127.0.0.1:8000";
+  const resolverServiceUrl = (process.env.RESOLVER_SERVICE_URL || defaultResolverUrl).replace(/\/+$/, "");
+  if (resolverServiceUrl) {
+    try {
+      const res = await fetch(`${resolverServiceUrl}/resolve?id=${encodeURIComponent(videoId)}`, {
+        signal: AbortSignal.timeout(15000),
+      });
+      if (res.ok) {
+        const parsed = await res.json();
+        if (parsed.url) {
+          streamCache.set(videoId, {
+            url: parsed.url,
+            mimeType: parsed.mimeType || "audio/mp4",
+            itag: parsed.itag || 140,
+            duration: parsed.duration,
+            cachedAt: Date.now(),
+          });
+          return { url: parsed.url, duration: parsed.duration };
+        }
+      } else {
+        console.warn(`[getStreamUrlForYtm] Python resolver returned status ${res.status}`);
+      }
+    } catch (err) {
+      console.error("[getStreamUrlForYtm] Python resolver error:", err);
+    }
+  }
+
+  // 2. Fallback: Local Python script execution via pytubefix
+  const pythonBin =
+    process.env.PYTHON_BIN ||
+    (process.platform === "win32"
+      ? "C:\\Users\\SAMJIN\\AppData\\Local\\Programs\\Python\\Python39\\python.exe"
+      : "python3");
   const scriptPath = path.join(process.cwd(), "scripts", "resolve_stream.py");
 
   try {
@@ -44,7 +80,7 @@ async function getStreamUrlForYtm(videoId: string, forceRefresh = false): Promis
       return { url: parsed.url, duration: parsed.duration };
     }
   } catch (err) {
-    console.error("[getStreamUrlForYtm] Error resolving stream for", videoId, err);
+    console.error("[getStreamUrlForYtm] Local Python script error for", videoId, err);
   }
 
   return null;
@@ -94,16 +130,27 @@ export async function GET(
       const range = req.headers.get("range");
       const forwardHeaders: Record<string, string> = {
         "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
         Accept: "*/*",
       };
       if (range) {
         forwardHeaders["Range"] = range;
       }
 
-      const streamRes = await fetch(streamUrl, {
+      let streamRes = await fetch(streamUrl, {
         headers: forwardHeaders,
       });
+
+      // Upstream recovery: If Googlevideo returns 403 Forbidden or expired token, clear cache and re-resolve once
+      if (!streamRes.ok && streamRes.status !== 206 && provider === "ytm") {
+        console.warn(`[API /stream] Upstream audio fetch failed (${streamRes.status}), re-resolving with force-refresh...`);
+        streamCache.delete(providerTrackId);
+        const retryResolved = await getStreamUrlForYtm(providerTrackId, true);
+        if (retryResolved?.url) {
+          streamUrl = retryResolved.url;
+          streamRes = await fetch(streamUrl, { headers: forwardHeaders });
+        }
+      }
 
       const responseHeaders = new Headers();
       responseHeaders.set("Content-Type", streamRes.headers.get("content-type") || "audio/mp4");

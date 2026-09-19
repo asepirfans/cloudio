@@ -4,7 +4,7 @@
  */
 
 const AUDIUS_REGISTRY = "https://api.audius.co";
-const APP_NAME = "CloudBeats"; // app name for Audius API identification
+const APP_NAME = "Cloudio"; // app name for Audius API identification
 
 let cachedNode: string | null = null;
 let nodeExpiry = 0;

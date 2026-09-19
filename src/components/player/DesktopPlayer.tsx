@@ -20,12 +20,13 @@ export function DesktopPlayer() {
     setShowLyrics,
     showQueue,
     showLyrics,
+    queuePulse,
   } = usePlayerStore();
 
   if (!currentTrack) {
     return (
       <div
-        className="hidden md:block h-20 border-t"
+        className="hidden md:block h-24 border-t"
         style={{
           borderColor: "var(--color-border)",
           backgroundColor: "var(--color-surface)",
@@ -37,7 +38,7 @@ export function DesktopPlayer() {
   return (
     <>
       <div
-        className="hidden md:flex h-20 border-t items-center px-4 gap-4 shrink-0"
+        className="hidden md:flex h-24 border-t items-center px-6 gap-6 shrink-0 z-40"
         style={{
           borderColor: "var(--color-border)",
           backgroundColor: "var(--color-surface)",
@@ -45,17 +46,21 @@ export function DesktopPlayer() {
       >
         {/* Track info (left) */}
         <button
-          className="flex items-center gap-3 min-w-0 w-52 shrink-0 cursor-pointer"
-          onClick={() => setShowFullPlayer(true)}
-          aria-label={`Now playing: ${currentTrack.title}`}
+          className="flex items-center gap-3.5 min-w-0 w-60 shrink-0 cursor-pointer group"
+          onClick={() => {
+            setShowLyrics(false);
+            setShowQueue(false);
+            setShowFullPlayer(true);
+          }}
+          aria-label={`Now playing: ${currentTrack.title}. Klik untuk lihat detail.`}
         >
-          <div className="w-11 h-11 rounded-lg overflow-hidden shrink-0">
+          <div className="w-12 h-12 rounded-lg overflow-hidden shrink-0 shadow-md transition-transform group-hover:scale-105">
             {currentTrack.artworkUrl ? (
               <Image
                 src={currentTrack.artworkUrl}
                 alt=""
-                width={44}
-                height={44}
+                width={48}
+                height={48}
                 className="w-full h-full object-cover"
                 unoptimized
                 referrerPolicy="no-referrer"
@@ -66,13 +71,13 @@ export function DesktopPlayer() {
           </div>
           <div className="min-w-0 text-left">
             <p
-              className="text-sm font-medium truncate"
+              className="text-sm font-semibold truncate group-hover:text-sky-400 transition-colors"
               style={{ color: "var(--color-text-primary)" }}
             >
               {currentTrack.title}
             </p>
             <p
-              className="text-xs truncate"
+              className="text-xs truncate mt-0.5"
               style={{ color: "var(--color-text-secondary)" }}
             >
               {currentTrack.artist}
@@ -81,35 +86,59 @@ export function DesktopPlayer() {
         </button>
 
         {/* Center: controls + seekbar */}
-        <div className="flex-1 flex flex-col items-center justify-center gap-1 min-w-0">
+        <div className="flex-1 flex flex-col items-center justify-center gap-2 min-w-0 max-w-xl mx-auto">
           <PlayerControls size="sm" />
-          <div className="w-full max-w-lg">
-            <SeekBar />
+          <div className="w-full">
+            <SeekBar inline />
           </div>
         </div>
 
         {/* Right: volume + queue + lyrics */}
-        <div className="flex items-center gap-1 w-52 shrink-0 justify-end">
+        <div className="flex items-center gap-2 w-60 shrink-0 justify-end">
           {/* Lyrics */}
           <button
-            onClick={() => { setShowLyrics(!showLyrics); setShowQueue(false); }}
+            onClick={() => {
+              if (showFullPlayer && showLyrics) {
+                setShowFullPlayer(false);
+                setShowLyrics(false);
+              } else {
+                setShowQueue(false);
+                setShowLyrics(true);
+                setShowFullPlayer(true);
+              }
+            }}
             className="touch-target rounded-lg transition-fast"
-            style={{ color: showLyrics ? "var(--color-accent)" : "var(--color-text-muted)" }}
+            style={{ color: showFullPlayer && showLyrics ? "var(--color-accent)" : "var(--color-text-muted)" }}
             aria-label="Toggle lyrics"
-            aria-pressed={showLyrics}
+            aria-pressed={showFullPlayer && showLyrics}
           >
             <Mic2 size={17} strokeWidth={1.8} aria-hidden="true" />
           </button>
 
           {/* Queue */}
           <button
-            onClick={() => { setShowQueue(!showQueue); setShowLyrics(false); }}
-            className="touch-target rounded-lg transition-fast"
-            style={{ color: showQueue ? "var(--color-accent)" : "var(--color-text-muted)" }}
+            onClick={() => {
+              if (showFullPlayer && showQueue) {
+                setShowFullPlayer(false);
+                setShowQueue(false);
+              } else {
+                setShowLyrics(false);
+                setShowQueue(true);
+                setShowFullPlayer(true);
+              }
+            }}
+            className={`relative touch-target rounded-lg transition-all ${
+              queuePulse ? "scale-125 text-sky-400" : ""
+            }`}
+            style={{ color: showFullPlayer && showQueue ? "var(--color-accent)" : queuePulse ? "#38bdf8" : "var(--color-text-muted)" }}
             aria-label="Toggle queue"
-            aria-pressed={showQueue}
+            aria-pressed={showFullPlayer && showQueue}
+            title="Antrean Putar"
           >
             <ListMusic size={17} strokeWidth={1.8} aria-hidden="true" />
+            {queuePulse && (
+              <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-sky-400 animate-ping" />
+            )}
           </button>
 
           {/* Volume */}

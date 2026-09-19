@@ -1,8 +1,9 @@
 "use client";
 
 import Link from "next/link";
+import Image from "next/image";
 import { usePathname } from "next/navigation";
-import { Home, Search, Library, Music2 } from "lucide-react";
+import { Home, Search, Library } from "lucide-react";
 import { clsx } from "clsx";
 
 const NAV_ITEMS = [
@@ -26,21 +27,17 @@ export function Sidebar() {
       <div className="px-5 pt-6 pb-4">
         <Link
           href="/"
-          className="flex items-center gap-2 group"
-          aria-label="CloudBeats home"
+          className="inline-flex items-center group transition-opacity hover:opacity-90"
+          aria-label="Cloudio home"
         >
-          <div
-            className="w-8 h-8 rounded-lg flex items-center justify-center"
-            style={{ backgroundColor: "var(--color-accent)" }}
-          >
-            <Music2 size={16} className="text-black" aria-hidden="true" />
-          </div>
-          <span
-            className="font-semibold text-[15px] tracking-tight"
-            style={{ color: "var(--color-text-primary)" }}
-          >
-            CloudBeats
-          </span>
+          <Image
+            src="/logo-horizontal.png"
+            alt="Cloudio"
+            width={136}
+            height={30}
+            className="h-7 w-auto object-contain"
+            priority
+          />
         </Link>
       </div>
 

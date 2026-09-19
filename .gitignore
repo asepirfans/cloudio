@@ -44,3 +44,9 @@ next-env.d.ts
 *.md
 !README.md
 !**/README.md
+
+# python
+__pycache__/
+*.py[cod]
+*$py.class
+

@@ -66,7 +66,7 @@ export class AudiusProvider implements MusicProvider {
   async getStream(providerTrackId: string): Promise<StreamSource | null> {
     try {
       const node = await getDiscoveryNode();
-      const streamUrl = `${node}/v1/tracks/${providerTrackId}/stream?app_name=CloudBeats`;
+      const streamUrl = `${node}/v1/tracks/${providerTrackId}/stream?app_name=Cloudio`;
 
       // Verify the stream URL is accessible via HEAD
       return {
