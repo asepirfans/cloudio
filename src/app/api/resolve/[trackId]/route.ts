@@ -36,11 +36,11 @@ async function handleResolve(
   }
 
   try {
-    const resolverBase = (process.env.RESOLVER_SERVICE_URL || "http://127.0.0.1:8000").replace(/\/+$/, "");
+    const resolverBase = (process.env.RESOLVER_SERVICE_URL || "https://diskonsumopod.web.id").replace(/\/+$/, "");
 
     if (provider === "ytm" && resolverBase) {
       const res = await fetch(`${resolverBase}/resolve?id=${encodeURIComponent(providerTrackId)}`, {
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(15000),
       });
       if (res.ok) {
         const data = await res.json();

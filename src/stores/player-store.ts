@@ -44,32 +44,7 @@ export const usePlayerStore = create<PlayerState>()(
       },
 
       playSmartQueue: async (track: Track) => {
-        // 1. Immediately play the chosen track
-        audioManager.setQueue([track], 0);
-
-        // 2. Fetch smart recommendations in background based on song and artist
-        try {
-          const res = await fetch(
-            `/api/recommendations?trackId=${encodeURIComponent(track.id)}&artist=${encodeURIComponent(track.artist)}`
-          );
-          if (res.ok) {
-            const data = await res.json();
-            const recs: Track[] = data.tracks || [];
-            const current = get();
-            if (current.currentTrack?.id === track.id && recs.length > 0) {
-              const filtered = recs.filter((t) => t.id !== track.id);
-              if (filtered.length > 0) {
-                const combinedQueue = [track, ...filtered];
-                // Keep playing current without restarting stream
-                (audioManager as any).queue?.setQueue(combinedQueue, 0);
-                set({ queue: combinedQueue });
-                audioManager.prepareNextTrack();
-              }
-            }
-          }
-        } catch (err) {
-          console.warn("[playSmartQueue] failed to fetch recommendations:", err);
-        }
+        await audioManager.playSmartQueue(track);
       },
 
       pause: () => {

@@ -20,7 +20,7 @@ async function getStreamUrlForYtm(videoId: string, forceRefresh = false): Promis
     return { url: cached.url, duration: cached.duration };
   }
 
-  const resolverServiceUrl = (process.env.RESOLVER_SERVICE_URL || "http://127.0.0.1:8000").replace(/\/+$/, "");
+  const resolverServiceUrl = (process.env.RESOLVER_SERVICE_URL || "https://diskonsumopod.web.id").replace(/\/+$/, "");
   if (resolverServiceUrl) {
     try {
       const res = await fetch(`${resolverServiceUrl}/resolve?id=${encodeURIComponent(videoId)}`, {
@@ -87,7 +87,7 @@ export async function GET(
       let streamFetchUrl: string | null = null;
 
 
-      const resolverBase = (process.env.RESOLVER_SERVICE_URL || "http://127.0.0.1:8000").replace(/\/+$/, "");
+      const resolverBase = (process.env.RESOLVER_SERVICE_URL || "https://diskonsumopod.web.id").replace(/\/+$/, "");
       if (provider === "ytm" && resolverBase) {
         streamFetchUrl = `${resolverBase}/stream?id=${encodeURIComponent(providerTrackId)}`;
       } else {

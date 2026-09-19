@@ -37,13 +37,17 @@ const nextConfig: NextConfig = {
     "192.168.15.157",
     "localhost:3000",
   ],
+  env: {
+    RESOLVER_SERVICE_URL: process.env.RESOLVER_SERVICE_URL || "https://diskonsumopod.web.id",
+    NEXT_PUBLIC_RESOLVER_URL: process.env.NEXT_PUBLIC_RESOLVER_URL || "https://diskonsumopod.web.id",
+  },
   rewrites: async () => [
     {
       source: "/api/py/:path*",
       destination:
         process.env.NODE_ENV === "development"
           ? "http://127.0.0.1:8000/api/py/:path*"
-          : "/api/index.py",
+          : "https://diskonsumopod.web.id/api/py/:path*",
     },
   ],
 };

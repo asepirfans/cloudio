@@ -30,34 +30,22 @@ export async function prewarmNextTrack(track: Track): Promise<boolean> {
   audioLogger.log(`Preparing next track: ${track.id} (${track.title})`);
 
   try {
-    // 1. Try dedicated resolver endpoint first
-    const resolveUrl = `/api/resolve/${encodeURIComponent(track.id)}`;
-    const resolvePromise = fetch(resolveUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      signal: AbortSignal.timeout(6000),
+    const parts = track.id.split(":");
+    const providerTrackId = parts.length > 1 ? parts.slice(1).join(":") : track.id;
+    const resolverUrl = (process.env.NEXT_PUBLIC_RESOLVER_URL || "https://diskonsumopod.web.id").replace(/\/+$/, "");
+
+    // Directly prime the resolver cache in background (20s timeout so pytubefix has time to finish)
+    const directPromise = fetch(`${resolverUrl}/resolve?id=${encodeURIComponent(providerTrackId)}`, {
+      signal: AbortSignal.timeout(20000),
     }).catch(() => null);
 
-    // 2. Also send lightweight 64KB range request to prime the edge CDN buffer
-    const streamUrl = `/api/stream/${encodeURIComponent(track.id)}?audio=true`;
-    const streamPromise = fetch(streamUrl, {
-      headers: {
-        Range: "bytes=0-65535",
-      },
-      signal: AbortSignal.timeout(6000),
-    })
-      .then(async (res) => {
-        if (res.body) {
-          // Read first chunk and cancel reader so we do not download full song
-          const reader = res.body.getReader();
-          await reader.read().catch(() => {});
-          await reader.cancel().catch(() => {});
-        }
-        return res.ok || res.status === 206;
-      })
-      .catch(() => false);
+    // Also prime through Next.js proxy route
+    const proxyPromise = fetch(`/api/resolve/${encodeURIComponent(track.id)}`, {
+      method: "POST",
+      signal: AbortSignal.timeout(20000),
+    }).catch(() => null);
 
-    await Promise.race([resolvePromise, streamPromise]);
+    await Promise.race([directPromise, proxyPromise]);
 
     warmedTracks.set(track.id, now);
     audioLogger.log(`Next track prepared: ${track.id}`);

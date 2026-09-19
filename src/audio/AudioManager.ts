@@ -473,15 +473,22 @@ export class AudioManager {
     this.audio.src = streamUrl;
     this.audio.load();
 
-    // 3. Initiate playback
+    // 3. Initiate playback with non-blocking promise handler for mobile continuity
     try {
-      await this.audio.play();
-      audioLogger.log("audio.play() resolved");
-      this.syncStore({ isPlaying: true, status: "PLAYING", isBuffering: false });
-      setMediaSessionPlaybackState("playing");
+      const playPromise = this.audio.play();
+      if (playPromise !== undefined) {
+        playPromise
+          .then(() => {
+            audioLogger.log("audio.play() resolved");
+            this.syncStore({ isPlaying: true, status: "PLAYING", isBuffering: false });
+            setMediaSessionPlaybackState("playing");
+          })
+          .catch((err) => {
+            audioLogger.warn("audio.play() deferred:", err?.message || err);
+          });
+      }
     } catch (err: any) {
-      audioLogger.warn("audio.play() rejected (awaiting buffer or gesture):", err?.message || err);
-      // Keep isPlaying: true so lock-screen stays active
+      audioLogger.warn("audio.play() error:", err?.message || err);
     }
 
     // Proactively prewarm next track & replenish autoplay queue in background
@@ -499,6 +506,33 @@ export class AudioManager {
       this.currentTrack = track;
       this.nextTrackPrepared = false;
       this.loadAndPlayCurrentTrack();
+    }
+  }
+
+  public async playSmartQueue(track: Track) {
+    this.currentTrack = track;
+    this.queue.setQueue([track], 0);
+    this.nextTrackPrepared = false;
+    await this.loadAndPlayCurrentTrack();
+
+    try {
+      const res = await fetch(
+        `/api/recommendations?trackId=${encodeURIComponent(track.id)}&artist=${encodeURIComponent(track.artist)}`
+      );
+      if (res.ok) {
+        const data = await res.json();
+        const recs: Track[] = data.tracks || [];
+        if (this.currentTrack?.id === track.id && recs.length > 0) {
+          const filtered = recs.filter((t) => t.id !== track.id);
+          if (filtered.length > 0) {
+            this.queue.appendTracks(filtered);
+            this.syncStore({ queue: this.queue.getRawQueue() });
+            this.prepareNextTrack();
+          }
+        }
+      }
+    } catch (err) {
+      audioLogger.warn("Failed to fetch smart queue recommendations:", err);
     }
   }
 
@@ -757,6 +791,16 @@ export class AudioManager {
     if (offlineUrl) {
       return offlineUrl;
     }
+
+    const parts = track.id.split(":");
+    const provider = parts.length > 1 ? parts[0] : (track.provider || "ytm");
+    const providerTrackId = parts.length > 1 ? parts.slice(1).join(":") : track.id;
+
+    if (provider === "ytm") {
+      const resolverBase = (process.env.NEXT_PUBLIC_RESOLVER_URL || "https://diskonsumopod.web.id").replace(/\/+$/, "");
+      return `${resolverBase}/stream?id=${encodeURIComponent(providerTrackId)}`;
+    }
+
     return `/api/stream/${encodeURIComponent(track.id)}?audio=true`;
   }
 }
