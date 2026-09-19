@@ -1,7 +1,8 @@
 import os
 import time
-import httpx
-from fastapi import FastAPI, HTTPException, Query, Request
+import urllib.request
+import urllib.error
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pytubefix import YouTube
@@ -63,55 +64,66 @@ def get_stream_data(video_id: str):
 def health_check():
     return {"status": "ok", "service": "cloudio-resolver", "version": "1.0.0"}
 
-@app.get("/resolve")
+@app.api_route("/resolve", methods=["GET", "HEAD"])
 def resolve_stream(id: str = Query(..., description="YouTube video ID")):
     if not id or len(id.strip()) == 0:
         raise HTTPException(status_code=400, detail="Missing or invalid video ID")
     video_id = id.strip()
     return get_stream_data(video_id)
 
-@app.get("/stream")
-async def proxy_audio_stream(request: Request, id: str = Query(..., description="YouTube video ID")):
+@app.api_route("/stream", methods=["GET", "HEAD"])
+def proxy_audio_stream(request: Request, id: str = Query(..., description="YouTube video ID")):
     if not id or len(id.strip()) == 0:
         raise HTTPException(status_code=400, detail="Missing or invalid video ID")
     video_id = id.strip()
     data = get_stream_data(video_id)
     stream_url = data["url"]
 
+    req = urllib.request.Request(
+        stream_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
+            "Accept": "*/*",
+        },
+    )
     range_header = request.headers.get("range")
-    req_headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-        "Accept": "*/*",
-    }
     if range_header:
-        req_headers["range"] = range_header
+        req.add_header("Range", range_header)
 
-    client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
-    req = client.build_request("GET", stream_url, headers=req_headers)
-    resp = await client.send(req, stream=True)
+    try:
+        upstream = urllib.request.urlopen(req, timeout=30)
+    except urllib.error.HTTPError as err:
+        upstream = err
 
     resp_headers = {
-        "Content-Type": resp.headers.get("content-type", "audio/mp4"),
+        "Content-Type": upstream.headers.get("Content-Type", "audio/mp4"),
         "Accept-Ranges": "bytes",
         "Access-Control-Allow-Origin": "*",
         "Cache-Control": "public, max-age=3600",
     }
-    if "content-range" in resp.headers:
-        resp_headers["Content-Range"] = resp.headers["content-range"]
-    if "content-length" in resp.headers:
-        resp_headers["Content-Length"] = resp.headers["content-length"]
+    if upstream.headers.get("Content-Range"):
+        resp_headers["Content-Range"] = upstream.headers.get("Content-Range")
+    if upstream.headers.get("Content-Length"):
+        resp_headers["Content-Length"] = upstream.headers.get("Content-Length")
 
-    async def body_stream():
+    if request.method == "HEAD":
+        upstream.close()
+        return Response(status_code=getattr(upstream, "status", 200), headers=resp_headers)
+
+    def body_generator():
         try:
-            async for chunk in resp.aiter_bytes(chunk_size=65536):
+            while True:
+                chunk = upstream.read(65536)
+                if not chunk:
+                    break
                 yield chunk
         finally:
-            await resp.aclose()
-            await client.aclose()
+            upstream.close()
 
+    status_code = getattr(upstream, "status", 200)
     return StreamingResponse(
-        body_stream(),
-        status_code=resp.status_code,
+        body_generator(),
+        status_code=status_code,
         headers=resp_headers,
     )
 
