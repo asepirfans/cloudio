@@ -1,5 +1,4 @@
 import os
-from typing import Optional
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pytubefix import YouTube
@@ -10,7 +9,6 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# Enable CORS for Next.js or direct client calls
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,33 +29,33 @@ def resolve_stream(id: str = Query(..., description="YouTube video ID")):
 
     video_id = id.strip()
     url = f"https://www.youtube.com/watch?v={video_id}"
+    last_err = None
 
-    try:
-        yt = YouTube(url, use_po_token=False)
+    for client_name in ["ANDROID", "IOS", "MWEB"]:
+        try:
+            yt = YouTube(url, client=client_name)
+            stream = (
+                yt.streams.get_by_itag(140)
+                or yt.streams.get_by_itag(139)
+                or yt.streams.filter(only_audio=True, mime_type="audio/mp4").first()
+                or yt.streams.get_audio_only()
+            )
 
-        # Prioritize AAC audio streams (itag 140 = 128kbps, 139 = 48kbps)
-        # WebM/Opus can have inconsistent duration headers in browsers.
-        stream = (
-            yt.streams.get_by_itag(140)
-            or yt.streams.get_by_itag(139)
-            or yt.streams.filter(only_audio=True, mime_type="audio/mp4").first()
-            or yt.streams.get_audio_only()
-        )
+            if stream and stream.url:
+                return {
+                    "url": stream.url,
+                    "mimeType": stream.mime_type or "audio/mp4",
+                    "itag": stream.itag,
+                    "title": yt.title,
+                    "duration": yt.length,
+                }
+        except Exception as exc:
+            last_err = exc
+            continue
 
-        if not stream or not stream.url:
-            raise HTTPException(status_code=404, detail="No suitable audio stream found")
-
-        return {
-            "url": stream.url,
-            "mimeType": stream.mime_type,
-            "itag": stream.itag,
-            "title": yt.title,
-            "duration": yt.length,
-        }
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+    if last_err:
+        raise HTTPException(status_code=500, detail=str(last_err))
+    raise HTTPException(status_code=404, detail="No suitable audio stream found")
 
 if __name__ == "__main__":
     import uvicorn

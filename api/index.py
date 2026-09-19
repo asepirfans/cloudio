@@ -32,28 +32,34 @@ def resolve_stream(id: str = Query(..., description="YouTube video ID")):
     video_id = id.strip()
     url = f"https://www.youtube.com/watch?v={video_id}"
 
-    try:
-        yt = YouTube(url, use_po_token=False)
+    # Use clients that bypass datacenter IP bot detection (ANDROID, IOS, MWEB)
+    clients_to_try = ["ANDROID", "IOS", "MWEB"]
+    last_error = None
 
-        # Prioritize audio streams (itag 140 = 128kbps AAC, 139 = 48kbps)
-        stream = (
-            yt.streams.get_by_itag(140)
-            or yt.streams.get_by_itag(139)
-            or yt.streams.filter(only_audio=True, mime_type="audio/mp4").first()
-            or yt.streams.get_audio_only()
-        )
+    for client_name in clients_to_try:
+        try:
+            yt = YouTube(url, client=client_name)
 
-        if not stream or not stream.url:
-            raise HTTPException(status_code=404, detail="No suitable audio stream found")
+            # Prioritize clean AAC audio stream (itag 140 = 128kbps, 139 = 48kbps)
+            stream = (
+                yt.streams.get_by_itag(140)
+                or yt.streams.get_by_itag(139)
+                or yt.streams.filter(only_audio=True, mime_type="audio/mp4").first()
+                or yt.streams.get_audio_only()
+            )
 
-        return {
-            "url": stream.url,
-            "mimeType": stream.mime_type,
-            "itag": stream.itag,
-            "title": yt.title,
-            "duration": yt.length,
-        }
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+            if stream and stream.url:
+                return {
+                    "url": stream.url,
+                    "mimeType": stream.mime_type or "audio/mp4",
+                    "itag": stream.itag,
+                    "title": yt.title,
+                    "duration": yt.length,
+                }
+        except Exception as exc:
+            last_error = exc
+            continue
+
+    if last_error:
+        raise HTTPException(status_code=500, detail=str(last_error))
+    raise HTTPException(status_code=404, detail="No suitable audio stream found")
