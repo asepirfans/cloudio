@@ -127,6 +127,13 @@ export async function GET(
 
     // Direct audio streaming proxy (handles HTTP Range requests with status 206 Partial Content)
     if (searchParams.get("audio") === "true" || searchParams.get("play") === "true") {
+      // If custom external resolver (e.g. Cloudflare Tunnel to local PC) is configured,
+      // redirect client directly to the resolver's streaming proxy for 0ms Vercel overhead and flawless range streaming!
+      if (provider === "ytm" && process.env.RESOLVER_SERVICE_URL) {
+        const resolverBase = process.env.RESOLVER_SERVICE_URL.replace(/\/+$/, "");
+        return NextResponse.redirect(`${resolverBase}/stream?id=${encodeURIComponent(providerTrackId)}`);
+      }
+
       const range = req.headers.get("range");
       const forwardHeaders: Record<string, string> = {
         "User-Agent":

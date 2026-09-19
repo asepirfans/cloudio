@@ -66,17 +66,19 @@ function setupMediaSessionActionHandlers() {
   });
 
   navigator.mediaSession.setActionHandler("seekbackward", (details) => {
+    const cur = usePlayerStore.getState().currentTime;
+    const newPos = Math.max(0, cur - (details.seekOffset ?? 10));
     const audio = getAudio();
-    const newPos = Math.max(0, audio.currentTime - (details.seekOffset ?? 10));
     audio.currentTime = newPos;
     usePlayerStore.getState().setCurrentTime(newPos);
     syncMediaSessionPosition();
   });
 
   navigator.mediaSession.setActionHandler("seekforward", (details) => {
+    const cur = usePlayerStore.getState().currentTime;
+    const dur = usePlayerStore.getState().duration || Infinity;
+    const newPos = Math.min(dur, cur + (details.seekOffset ?? 10));
     const audio = getAudio();
-    const dur = audio.duration || usePlayerStore.getState().duration || Infinity;
-    const newPos = Math.min(dur, audio.currentTime + (details.seekOffset ?? 10));
     audio.currentTime = newPos;
     usePlayerStore.getState().setCurrentTime(newPos);
     syncMediaSessionPosition();
