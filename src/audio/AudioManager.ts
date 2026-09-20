@@ -235,6 +235,12 @@ export class AudioManager {
       }
       const code = this.audio.error?.code;
       const msg = this.audio.error?.message;
+
+      // Ignore aborted requests (code 1 = MEDIA_ERR_ABORTED) — occurs normally when switching tracks or backgrounding
+      if (!code || code === 1) {
+        return;
+      }
+
       audioLogger.error(`Audio error: code=${code}, message=${msg}`);
 
       if (this.currentTrack && this.lastFailedTrackId !== this.currentTrack.id) {
@@ -467,6 +473,7 @@ export class AudioManager {
   private async loadAndPlayCurrentTrack() {
     if (!this.currentTrack) return;
 
+    this.endedWhileBackgrounded = false;
     const track = this.currentTrack;
     this.shouldBePlaying = true;
 
@@ -703,17 +710,31 @@ export class AudioManager {
     const dur = this.getEffectiveDuration();
     const curTime = this.audio.currentTime;
 
-    const trackFinishedWhileHidden =
-      this.endedWhileBackgrounded || isEnded || (dur > 0 && curTime >= dur - 1);
+    // Reset background tracking flag immediately
+    this.endedWhileBackgrounded = false;
 
-    if (trackFinishedWhileHidden && this.shouldBePlaying && !this.isTransitioning) {
+    // 1. If audio is actively playing or in the middle of playback, NEVER advance the queue!
+    const isPlayingMidTrack = !isPaused && (dur === 0 || curTime < dur - 1.5);
+    if (isPlayingMidTrack) {
+      this.syncStore({
+        currentTime: curTime,
+        duration: dur,
+        isPlaying: true,
+        status: "PLAYING",
+      });
+      return;
+    }
+
+    // 2. Only recover if the track has genuinely reached the end AND playback is halted
+    const trackFinished = isEnded || (dur > 2 && curTime >= dur - 0.5);
+
+    if (trackFinished && isPaused && this.shouldBePlaying && !this.isTransitioning) {
       audioLogger.log("recovering queue transition");
-      this.endedWhileBackgrounded = false;
       this.next();
       return;
     }
 
-    // Reconcile Zustand UI state with actual audio element reality
+    // 3. Reconcile Zustand UI state with actual audio element reality
     this.syncStore({
       currentTime: curTime,
       duration: dur,
