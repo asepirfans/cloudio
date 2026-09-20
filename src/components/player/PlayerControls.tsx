@@ -3,7 +3,6 @@
 import { Play, Pause, SkipBack, SkipForward, Shuffle, Repeat, Repeat1, Loader2 } from "lucide-react";
 import { clsx } from "clsx";
 import { usePlayerStore } from "@/stores/player-store";
-import { getAudio } from "@/player/audio-engine";
 import type { RepeatMode } from "@/types/music";
 
 interface PlayerControlsProps {
@@ -37,14 +36,7 @@ export function PlayerControls({ size = "md" }: PlayerControlsProps) {
   const isLoading = status === "RESOLVING" || status === "LOADING" || isBuffering;
 
   const handlePlayPause = () => {
-    const audio = getAudio();
-    if (isPlaying) {
-      audio.pause();
-      usePlayerStore.getState().pause();
-    } else {
-      audio.play().catch(() => {});
-      usePlayerStore.getState().play();
-    }
+    usePlayerStore.getState().togglePlay();
   };
 
   return (
@@ -79,7 +71,7 @@ export function PlayerControls({ size = "md" }: PlayerControlsProps) {
           size === "lg" ? "w-14 h-14" : "w-11 h-11"
         )}
         style={{ backgroundColor: "var(--color-text-primary)" }}
-        aria-label={isPlaying ? "Pause" : "Play"}
+        aria-label={isPlaying || isLoading ? "Pause" : "Play"}
         disabled={!currentTrack}
       >
         {isLoading ? (

@@ -1,6 +1,6 @@
-import type { Track, RepeatMode, PlayerStatus } from "@/types/music";
+import type { Track, RepeatMode } from "@/types/music";
 import { QueueManager } from "./queue";
-import { prewarmNextTrack, getPreparedTrackUrl, retainPreparedTracks } from "./preload";
+import { prewarmNextTrack, prewarmTrackMetadata, retainPreparedTracks, getResolvedDuration, rememberResolvedDuration } from "./preload";
 import {
   setupMediaSession,
   updateMediaMetadata,
@@ -8,9 +8,14 @@ import {
   setMediaSessionPosition,
 } from "./mediaSession";
 import { audioLogger } from "./logger";
-import { getSyncOfflineTrackUrl, isTrackOffline } from "@/services/offline-storage";
+import { getSyncOfflineTrackUrl } from "@/services/offline-storage";
 
 // Storage key for preserving resume position across reloads
+// Python allows 35s to open a stream. Give it time to return before retrying.
+const STREAM_WAIT_MS = 40000;
+const STALLED_WAIT_MS = 12000;
+const REMOTE_NAVIGATION_COOLDOWN_MS = 450;
+const MAX_FAILED_TRACKS = 3;
 const RESUME_STORAGE_KEY = "cloudbeats_playback_resume";
 
 export interface AudioManagerStoreSync {
@@ -33,16 +38,25 @@ export class AudioManager {
   // State guards
   private isTransitioning: boolean = false;
   private playbackGeneration = 0;
+  private resolvedDuration: number | null = null;
+  private durationRequest: AbortController | null = null;
+  private endTimer: ReturnType<typeof setTimeout> | null = null;
+  private completedGeneration = -1;
+  private hasStartedCurrentTrack = false;
   private recoveryTimer: ReturnType<typeof setTimeout> | null = null;
   private recoveryAttempts = 0;
   private recommendationRequest: AbortController | null = null;
-  private nextTrackPrepared: boolean = false;
+  private lastPrewarmTime = 0;
+  private consecutiveFailures = 0;
+  private playRequest = 0;
+  private recoveryDeadline = 0;
+  private lastProgressTime = 0;
+  private nextRecommendationAt = 0;
   private shouldBePlaying: boolean = false;
-  private endedWhileBackgrounded: boolean = false;
   private pendingSeekTime: number | null = null;
   private lastResumeSaveTime: number = 0;
-  private isPrefetchingAutoplay: boolean = false;
   private lastSyncedSecond: number = -1;
+  private lastRemoteNavigationAt = 0;
 
   // Store sync hook
   private storeSync: AudioManagerStoreSync | null = null;
@@ -111,8 +125,8 @@ export class AudioManager {
 
   /**
    * Attaches the audio element to the DOM body.
-   * Required for mobile browsers (especially WebKit / iOS Safari PWA)
-   * so the media pipeline is not garbage-collected when the screen turns off.
+   * Keeps a single media element attached across page navigation.
+   * Background scheduling remains controlled by the browser.
    */
   private attachToDOM() {
     if (typeof document !== "undefined" && document.body && !document.body.contains(this.audio)) {
@@ -132,6 +146,9 @@ export class AudioManager {
 
     this.audio.addEventListener("playing", () => {
       if (!this.shouldBePlaying) return;
+      this.hasStartedCurrentTrack = true;
+      this.trace("media.playing");
+      this.scheduleEndCheck();
       this.clearRecoveryTimer();
       this.syncStore({ isPlaying: true, status: "PLAYING", isBuffering: false });
       setMediaSessionPlaybackState("playing");
@@ -142,10 +159,13 @@ export class AudioManager {
     });
 
     this.audio.addEventListener("pause", () => {
-      // If we are currently transitioning to the next track, do NOT mark state as paused
-      // Doing so causes the mobile OS to immediately terminate background playback
+      // Source selection may emit pause while the next track is loading.
       if (this.isTransitioning) return;
 
+      if (this.shouldBePlaying) {
+        this.trace("media.unexpected-pause");
+        this.scheduleRecovery();
+      }
       if (!this.shouldBePlaying) {
         audioLogger.log(`Track paused: ${this.currentTrack?.id}`);
         this.syncStore({ isPlaying: false, status: "PAUSED" });
@@ -155,6 +175,7 @@ export class AudioManager {
     });
 
     this.audio.addEventListener("timeupdate", () => {
+      if (this.checkTrackBoundary("timeupdate")) return;
       // Guard: don't overwrite position if we are applying a resume seek
       if (this.pendingSeekTime !== null) {
         if (
@@ -170,24 +191,17 @@ export class AudioManager {
       const curTime = this.audio.currentTime;
       const effectiveDuration = this.getEffectiveDuration();
 
-      // Proactively prewarm next track early as soon as playback starts (at curTime >= 2)
-      if (!this.nextTrackPrepared && curTime >= 2) {
-        this.nextTrackPrepared = true;
+      if (this.shouldBePlaying && !this.audio.paused && this.audio.readyState >= 3 && curTime > this.lastProgressTime) {
+        this.clearRecoveryTimer();
+        if (curTime >= 2) this.consecutiveFailures = 0;
+      }
+      this.lastProgressTime = curTime;
+      // Refresh stale warm metadata during long tracks, without fetching every tick.
+      if (this.shouldBePlaying && Date.now() - this.lastPrewarmTime > 15000) {
+        this.lastPrewarmTime = Date.now();
         this.prepareNextTrack();
       }
 
-      // Safety-net auto-advance only if ended event failed to fire after 1.5s past duration
-      if (
-        effectiveDuration > 0 &&
-        curTime >= effectiveDuration + 1.5 &&
-        !this.isTransitioning
-      ) {
-        audioLogger.warn("Duration exceeded without ended event, triggering safety advance");
-        this.handleTrackEnded();
-        return;
-      }
-
-      if (!this.audio.paused && this.audio.readyState >= 3) this.clearRecoveryTimer();
       this.syncStore({ currentTime: curTime });
       this.saveResumeState(false);
 
@@ -199,7 +213,9 @@ export class AudioManager {
     });
 
     this.audio.addEventListener("durationchange", () => {
-      const trackDur = this.currentTrack?.duration;
+      this.trace("media.durationchange");
+      this.scheduleEndCheck();
+      const trackDur = this.resolvedDuration || this.currentTrack?.duration;
       // Preserve verified duration from metadata to protect against iOS AAC bitrate misestimation
       if (trackDur && trackDur > 0) {
         this.syncStore({ duration: trackDur });
@@ -214,44 +230,57 @@ export class AudioManager {
     });
 
     this.audio.addEventListener("waiting", () => {
+      if (!this.shouldBePlaying) return;
+      this.trace("media.waiting");
       this.syncStore({ isBuffering: true, isPlaying: false, status: "BUFFERING" });
       setMediaSessionPlaybackState("paused");
       setMediaSessionPosition(this.audio.currentTime, this.getEffectiveDuration(), 1);
       this.scheduleRecovery();
     });
 
-    this.audio.addEventListener("canplay", () => {
-      this.syncStore({ isBuffering: false });
-      if (this.shouldBePlaying && this.audio.paused && !this.isTransitioning) {
-        this.audio.play().catch((err) => {
-          audioLogger.warn("Play on canplay deferred:", err?.message || err);
-        });
+    this.audio.addEventListener("loadedmetadata", () => {
+      if (this.pendingSeekTime !== null) {
+        try { this.audio.currentTime = this.pendingSeekTime; } catch { /* Retry on the next ready event. */ }
       }
+      this.trace("media.metadata");
+    });
+
+    this.audio.addEventListener("canplay", () => {
+      if (this.shouldBePlaying && this.audio.paused) this.requestPlay();
     });
 
     this.audio.addEventListener("stalled", () => {
-      audioLogger.warn("Audio stream stalled, network may be slow");
-      this.scheduleRecovery();
+      this.trace("media.stalled");
+      this.scheduleRecovery(STALLED_WAIT_MS);
     });
 
     this.audio.addEventListener("ended", () => {
-      audioLogger.log("Current track ended");
-      this.handleTrackEnded();
+      this.trace("media.ended-event");
+      // A queued event from the previous source must not advance the new one.
+      if (this.audio.ended) this.handleTrackEnded();
     });
+    this.audio.addEventListener("seeking", () => {
+      this.trace("media.seeking");
+      this.clearEndTimer();
+    });
+    this.audio.addEventListener("seeked", () => {
+      this.trace("media.seeked");
+      if (!this.checkTrackBoundary("seeked")) this.scheduleEndCheck();
+    });
+    this.audio.addEventListener("ratechange", () => this.scheduleEndCheck());
 
     this.audio.addEventListener("error", () => {
       if (!this.audio.src || this.audio.src === "" || this.audio.src === window.location.href) {
         return;
       }
       const code = this.audio.error?.code;
-      const msg = this.audio.error?.message;
 
       // Ignore aborted requests (code 1 = MEDIA_ERR_ABORTED) — occurs normally when switching tracks or backgrounding
       if (!code || code === 1) {
         return;
       }
 
-      audioLogger.error(`Audio error: code=${code}, message=${msg}`);
+      this.trace("media.error", { code });
 
       if (this.shouldBePlaying) this.recoverPlayback();
     });
@@ -275,7 +304,7 @@ export class AudioManager {
   private bindUserGestureUnlock() {
     const unlock = () => {
       if (this.shouldBePlaying && this.audio.paused && this.currentTrack) {
-        this.audio.play().catch(() => {});
+        this.requestPlay();
       }
     };
     window.addEventListener("touchend", unlock, { passive: true });
@@ -286,8 +315,8 @@ export class AudioManager {
     setupMediaSession({
       onPlay: () => this.play(),
       onPause: () => this.pause(),
-      onNext: () => this.next(),
-      onPrevious: () => this.previous(),
+      onNext: () => this.handleRemoteNavigation("next"),
+      onPrevious: () => this.handleRemoteNavigation("previous"),
       onSeekTo: (time, fastSeek) => this.seek(time, fastSeek),
       onSeekForward: (offset) => {
         const cur = this.audio.currentTime;
@@ -305,8 +334,8 @@ export class AudioManager {
   private rebindMediaSessionActions() {
     if (typeof window === "undefined" || !("mediaSession" in navigator)) return;
     try {
-      navigator.mediaSession.setActionHandler("nexttrack", () => this.next());
-      navigator.mediaSession.setActionHandler("previoustrack", () => this.previous());
+      navigator.mediaSession.setActionHandler("nexttrack", () => this.handleRemoteNavigation("next"));
+      navigator.mediaSession.setActionHandler("previoustrack", () => this.handleRemoteNavigation("previous"));
       navigator.mediaSession.setActionHandler("seekto", (details) => {
         if (details.seekTime !== undefined && Number.isFinite(details.seekTime)) {
           this.seek(details.seekTime, Boolean(details.fastSeek));
@@ -319,43 +348,51 @@ export class AudioManager {
     }
   }
 
-  // ─── Playback Controls ───────────────────────────────────────────────────
-
-  public async play(track?: Track) {
-    if (track) {
-      this.cancelPendingRecommendations();
-      this.currentTrack = track;
-      this.queue.setQueue([track], 0);
-      await this.loadAndPlayCurrentTrack();
+  private handleRemoteNavigation(direction: "next" | "previous") {
+    const now = Date.now();
+    // WebKit can release callbacks accumulated during suspension in one burst.
+    // Replacing src for every stale callback leaves the final request stuck.
+    if (now - this.lastRemoteNavigationAt < REMOTE_NAVIGATION_COOLDOWN_MS) {
+      this.trace("remote.navigation-suppressed", { direction });
       return;
     }
+    this.lastRemoteNavigationAt = now;
+    this.trace(direction === "next" ? "remote.next" : "remote.previous");
+    if (direction === "next") this.next();
+    else this.previous();
+  }
 
+  // ─── Playback Controls ───────────────────────────────────────────────────
+
+  public play(track?: Track) {
+    this.trace("control.play");
+    this.consecutiveFailures = 0;
+    if (track) {
+      this.currentTrack = track;
+      this.queue.setQueue([track], 0);
+      this.loadAndPlayCurrentTrack();
+      return;
+    }
+    if (!this.currentTrack) return;
     this.shouldBePlaying = true;
     this.recoveryAttempts = 0;
-    this.scheduleRecovery();
-    const generation = this.playbackGeneration;
-    try {
-      await this.audio.play();
-      if (generation !== this.playbackGeneration || !this.shouldBePlaying) return;
-      this.clearRecoveryTimer();
-      this.syncStore({ isPlaying: true, status: "PLAYING", isBuffering: false });
-      setMediaSessionPlaybackState("playing");
-      setMediaSessionPosition(
-        this.audio.currentTime,
-        this.getEffectiveDuration(),
-        this.audio.playbackRate || 1
-      );
-    } catch (err: any) {
-      audioLogger.warn("Audio play() rejected:", err?.message || err);
+    if (this.audio.error) {
+      this.loadAndPlayCurrentTrack(true);
+      return;
     }
+    this.requestPlay();
+    this.scheduleRecovery();
   }
 
   public pause() {
+    this.trace("control.pause");
+    this.clearEndTimer();
     this.shouldBePlaying = false;
-    this.recommendationRequest?.abort();
+    this.playRequest++;
+    this.cancelPendingRecommendations();
     this.clearRecoveryTimer();
     this.audio.pause();
-    this.syncStore({ isPlaying: false, status: "PAUSED" });
+    this.syncStore({ isPlaying: false, isBuffering: false, status: "PAUSED" });
     setMediaSessionPlaybackState("paused");
     setMediaSessionPosition(this.audio.currentTime, this.getEffectiveDuration(), 0);
   }
@@ -367,13 +404,16 @@ export class AudioManager {
   public seek(time: number, fastSeek = false) {
     if (!Number.isFinite(time)) return;
     try {
-      const targetTime = Math.max(0, time);
+      const targetTime = Math.max(0, this.resolvedDuration ? Math.min(time, this.resolvedDuration) : time);
+      this.clearEndTimer();
+      this.trace("control.seek", { targetTime });
       if (fastSeek && "fastSeek" in this.audio && typeof (this.audio as any).fastSeek === "function") {
         (this.audio as any).fastSeek(targetTime);
       } else {
         this.audio.currentTime = targetTime;
       }
       this.syncStore({ currentTime: targetTime });
+      this.scheduleEndCheck();
       setMediaSessionPosition(
         targetTime,
         this.getEffectiveDuration(),
@@ -384,68 +424,50 @@ export class AudioManager {
     }
   }
 
-  public async next() {
+  public next() {
+    this.trace("control.next");
     this.cancelPendingRecommendations();
-    if (this.isTransitioning) return;
-    this.isTransitioning = true;
-    try {
-      await this.playNext();
-    } finally {
-      this.isTransitioning = false;
-    }
+    this.consecutiveFailures = 0;
+    this.playNext(true);
   }
 
-  public async previous() {
+  public previous() {
+    this.trace("control.previous");
     this.cancelPendingRecommendations();
-    if (this.isTransitioning) return;
-    this.isTransitioning = true;
-    try {
-      await this.playPrevious();
-    } finally {
-      this.isTransitioning = false;
-    }
+    this.consecutiveFailures = 0;
+    this.playPrevious();
   }
 
   /**
    * Internal track completion handler.
    * Runs natively inside the 'ended' event loop without depending on React re-render.
    */
-  private async handleTrackEnded() {
-    if (document.visibilityState === "hidden") {
-      this.endedWhileBackgrounded = true;
-      audioLogger.log("ended while backgrounded");
-    }
-
-    try {
-      localStorage.removeItem(RESUME_STORAGE_KEY);
-    } catch {}
-
+  private handleTrackEnded() {
+    if (!this.shouldBePlaying || this.isTransitioning || this.completedGeneration === this.playbackGeneration) return;
+    this.completedGeneration = this.playbackGeneration;
+    this.clearEndTimer();
+    this.trace("media.ended");
+    this.clearRecoveryTimer();
+    try { localStorage.removeItem(RESUME_STORAGE_KEY); } catch {}
     if (this.queue.getRepeatMode() === "track" && this.currentTrack) {
-      audioLogger.log(`Repeat track: replaying ${this.currentTrack.id}`);
       this.audio.currentTime = 0;
-      this.syncStore({ currentTime: 0, isPlaying: true, status: "PLAYING" });
-      this.audio.play().catch(() => {});
+      this.completedGeneration = -1;
+      this.scheduleEndCheck();
+      this.requestPlay();
+      this.scheduleRecovery();
       return;
     }
-
-    // Keep MediaSession alive during track boundary
-    setMediaSessionPlaybackState("playing");
-
-    if (this.isTransitioning) return;
-    this.isTransitioning = true;
-
-    try {
-      await this.playNext();
-    } finally {
-      this.isTransitioning = false;
-    }
+    this.playNext();
   }
 
   /**
    * Transitions to the next track using the exact same HTMLAudioElement instance.
    */
-  private async playNext() {
-    const nextTrack = this.queue.advance();
+  private playNext(skipRepeat = false) {
+    this.clearEndTimer();
+    this.playRequest++;
+    this.clearRecoveryTimer();
+    const nextTrack = this.queue.advance(skipRepeat);
 
     if (!nextTrack) {
       // If queue ended and autoplay (Infinite Radio) is enabled, fetch more recommendations
@@ -456,7 +478,8 @@ export class AudioManager {
 
       audioLogger.log("Queue ended, no further tracks");
       this.shouldBePlaying = false;
-      this.syncStore({ isPlaying: false, status: "ENDED" });
+      this.audio.pause();
+      this.syncStore({ isPlaying: false, isBuffering: false, status: "ENDED" });
       setMediaSessionPlaybackState("none");
       return;
     }
@@ -465,20 +488,20 @@ export class AudioManager {
     audioLogger.log(`Transitioning ${prevTrackId} -> ${nextTrack.id}`);
 
     this.currentTrack = nextTrack;
-    this.nextTrackPrepared = false;
 
-    await this.loadAndPlayCurrentTrack();
+    this.loadAndPlayCurrentTrack();
   }
 
-  private async playPrevious() {
+  private playPrevious() {
     // If > 3 seconds in, restart track
-    if (this.audio.currentTime > 3) {
+    if (this.audio.currentTime > 3 && !this.audio.paused && this.audio.readyState >= 3 && !this.audio.error) {
       this.audio.currentTime = 0;
       this.syncStore({ currentTime: 0 });
+      this.scheduleEndCheck();
       this.shouldBePlaying = true;
       this.recoveryAttempts = 0;
       this.scheduleRecovery();
-      void this.audio.play().catch(() => this.scheduleRecovery());
+      this.requestPlay();
       return;
     }
 
@@ -486,19 +509,24 @@ export class AudioManager {
     if (!prevTrack) return;
 
     this.currentTrack = prevTrack;
-    this.nextTrackPrepared = false;
-    await this.loadAndPlayCurrentTrack();
+    this.loadAndPlayCurrentTrack();
   }
 
   /**
    * Loads the current track stream and initiates playback.
    */
-  private async loadAndPlayCurrentTrack() {
+  private loadAndPlayCurrentTrack(forceRefresh = false) {
     if (!this.currentTrack) return;
 
-    this.endedWhileBackgrounded = false;
+    this.cancelPendingRecommendations();
     const track = this.currentTrack;
-    const generation = ++this.playbackGeneration;
+    this.clearEndTimer();
+    this.durationRequest?.abort();
+    this.resolvedDuration = getResolvedDuration(track.id);
+    this.hasStartedCurrentTrack = false;
+    ++this.playbackGeneration;
+    this.playRequest++;
+    this.lastProgressTime = 0;
     this.clearRecoveryTimer();
     this.recoveryAttempts = 0;
     this.pendingSeekTime = null;
@@ -525,87 +553,71 @@ export class AudioManager {
     });
 
     // 2. Set stream URL on the persistent HTMLAudioElement
-    const streamUrl = this.getStreamUrl(track);
-    this.audio.src = streamUrl;
+    const streamUrl = this.getStreamUrl(track, forceRefresh);
+    this.isTransitioning = true;
+    try { this.audio.src = streamUrl; } finally { this.isTransitioning = false; }
+    this.trace("track.load", { forceRefresh });
+    void this.resolveCurrentDuration();
     // Assigning src starts resource selection. Avoid an additional load() reset
     // at the lock-screen boundary; request playback in this same event handler.
 
-    // 3. Initiate playback with non-blocking promise handler for mobile continuity
-    try {
-      const playPromise = this.audio.play();
-      if (playPromise !== undefined) {
-        playPromise
-          .then(() => {
-            if (generation !== this.playbackGeneration || !this.shouldBePlaying) return;
-            this.clearRecoveryTimer();
-            audioLogger.log("audio.play() resolved");
-            this.syncStore({ isPlaying: true, status: "PLAYING", isBuffering: false });
-            setMediaSessionPlaybackState("playing");
-            setMediaSessionPosition(
-              this.audio.currentTime,
-              this.getEffectiveDuration(),
-              this.audio.playbackRate || 1
-            );
-            this.prepareNextTrack();
-          })
-          .catch((err) => {
-            if (generation !== this.playbackGeneration || !this.shouldBePlaying) return;
-            audioLogger.warn("audio.play() deferred:", err?.message || err);
-            this.scheduleRecovery();
-          });
-      }
-    } catch (err: any) {
-      audioLogger.warn("audio.play() error:", err?.message || err);
-    }
-
+    this.requestPlay();
     this.scheduleRecovery();
     this.prepareNextTrack();
+  }
+
+  // Every play attempt is scoped to both the selected track and latest command.
+  private requestPlay() {
+    if (!this.shouldBePlaying || !this.currentTrack) return;
+    const generation = this.playbackGeneration;
+    const request = ++this.playRequest;
+    this.trace("play.request");
+    try {
+      void this.audio.play().then(() => {
+        if (generation !== this.playbackGeneration || request !== this.playRequest || !this.shouldBePlaying) return;
+        this.hasStartedCurrentTrack = true;
+        this.trace("play.resolved");
+        this.scheduleEndCheck();
+        this.clearRecoveryTimer();
+        this.syncStore({ isPlaying: true, status: "PLAYING", isBuffering: false });
+        setMediaSessionPlaybackState("playing");
+        setMediaSessionPosition(this.audio.currentTime, this.getEffectiveDuration(), 1);
+        this.prepareNextTrack();
+      }).catch((error) => {
+        if (generation !== this.playbackGeneration || request !== this.playRequest || !this.shouldBePlaying) return;
+        this.trace("play.rejected", { name: error?.name || "Error" });
+        this.syncStore({ isPlaying: false, isBuffering: true, status: "BUFFERING" });
+        this.scheduleRecovery();
+      });
+    } catch (error) {
+      audioLogger.warn("play.exception", error);
+      this.scheduleRecovery();
+    }
   }
 
   // ─── Queue Operations ────────────────────────────────────────────────────
 
   public setQueue(tracks: Track[], startIndex: number = 0) {
     this.cancelPendingRecommendations();
+    this.consecutiveFailures = 0;
     this.queue.setQueue(tracks, startIndex);
     const track = this.queue.getCurrentTrack();
     if (track) {
       this.currentTrack = track;
-      this.nextTrackPrepared = false;
       this.loadAndPlayCurrentTrack();
     }
   }
 
   public async playSmartQueue(track: Track) {
-    this.cancelPendingRecommendations();
-    this.currentTrack = track;
-    this.queue.setQueue([track], 0);
-    this.nextTrackPrepared = false;
-    await this.loadAndPlayCurrentTrack();
-
-    try {
-      const res = await fetch(
-        `/api/recommendations?trackId=${encodeURIComponent(track.id)}&artist=${encodeURIComponent(track.artist)}`
-      );
-      if (res.ok) {
-        const data = await res.json();
-        const recs: Track[] = data.tracks || [];
-        if (this.currentTrack?.id === track.id && recs.length > 0) {
-          const filtered = recs.filter((t) => t.id !== track.id);
-          if (filtered.length > 0) {
-            this.queue.appendTracks(filtered);
-            this.syncStore({ queue: this.queue.getRawQueue() });
-            this.prepareNextTrack();
-          }
-        }
-      }
-    } catch (err) {
-      audioLogger.warn("Failed to fetch smart queue recommendations:", err);
-    }
+    this.nextRecommendationAt = 0;
+    this.setQueue([track], 0);
+    if (!this.recommendationRequest) await this.replenishAutoplayQueue(false);
   }
 
   public addToQueue(track: Track) {
     this.queue.addToQueue(track);
     this.syncStore({ queue: this.queue.getRawQueue() });
+    this.prepareNextTrack();
   }
 
   public playNextInQueue(track: Track) {
@@ -614,6 +626,7 @@ export class AudioManager {
       queue: this.queue.getRawQueue(),
       priorityQueueCount: this.queue.getPriorityQueueCount(),
     });
+    this.prepareNextTrack();
   }
 
   public removeFromQueue(index: number) {
@@ -623,6 +636,7 @@ export class AudioManager {
       currentIndex: this.queue.getCurrentIndex(),
       priorityQueueCount: this.queue.getPriorityQueueCount(),
     });
+    this.prepareNextTrack();
   }
 
   public clearQueue() {
@@ -632,6 +646,7 @@ export class AudioManager {
       currentIndex: this.queue.getCurrentIndex(),
       priorityQueueCount: 0,
     });
+    this.prepareNextTrack();
   }
 
   public setShuffle(shuffle: boolean) {
@@ -640,11 +655,13 @@ export class AudioManager {
       shuffle: this.queue.isShuffle(),
       currentIndex: this.queue.getCurrentIndex(),
     });
+    this.prepareNextTrack();
   }
 
   public setRepeatMode(mode: RepeatMode) {
     this.queue.setRepeatMode(mode);
     this.syncStore({ repeatMode: mode });
+    this.prepareNextTrack();
   }
 
   public setAutoplay(autoplay: boolean) {
@@ -666,95 +683,69 @@ export class AudioManager {
   // ─── Pre-warming & Autoplay ──────────────────────────────────────────────
 
   public prepareNextTrack() {
-    const nextTrack = this.queue.getNextTrack();
-    retainPreparedTracks([this.currentTrack?.id, nextTrack?.id].filter((id): id is string => !!id));
-    if (nextTrack) {
-      prewarmNextTrack(nextTrack).catch(() => {});
-    }
-
-    // Check if autoplay replenishment is needed (when <= 3 tracks left in queue)
-    const active = this.queue.getTracks();
-    const curIdx = this.queue.getCurrentIndex();
-    const remaining = active.length - curIdx;
-
-    if (this.queue.isAutoplay() && remaining <= 3 && !this.isPrefetchingAutoplay) {
-      this.replenishAutoplayQueue();
+    const upcoming = this.queue.getUpcomingTracks(2);
+    // Keep preparation for the new current track alive across a fast A -> B
+    // transition. Resolve two successors, but fetch a prefix only for nearest.
+    retainPreparedTracks([
+      ...(this.currentTrack ? [this.currentTrack.id] : []),
+      ...upcoming.map(track => track.id),
+    ]);
+    if (upcoming[0]) void prewarmNextTrack(upcoming[0]);
+    if (upcoming[1]) void prewarmTrackMetadata(upcoming[1]);
+    const remaining = this.queue.getTracks().length - this.queue.getCurrentIndex();
+    if (this.queue.isAutoplay() && remaining <= 3 && !this.recommendationRequest && Date.now() >= this.nextRecommendationAt) {
+      void this.replenishAutoplayQueue(false);
     }
   }
 
-  private async handleAutoplayQueueReplenish() {
-    if (!this.currentTrack) return;
-    this.syncStore({ status: "LOADING" });
+  private handleAutoplayQueueReplenish() {
+    this.cancelPendingRecommendations();
+    this.shouldBePlaying = true;
+    this.audio.pause();
+    this.clearRecoveryTimer();
+    this.syncStore({ status: "LOADING", isPlaying: false, isBuffering: true });
+    void this.replenishAutoplayQueue(true);
+  }
+
+  private async replenishAutoplayQueue(advanceWhenReady: boolean) {
+    if (!this.currentTrack || this.recommendationRequest) return;
     const generation = this.playbackGeneration;
     const controller = new AbortController();
     this.recommendationRequest = controller;
-    const timeout = setTimeout(() => controller.abort(), 12000);
-
+    this.nextRecommendationAt = Date.now() + 15000;
+    let timedOut = false;
+    const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, 15000);
+    const seed = this.queue.getTracks().at(-1) || this.currentTrack;
     try {
-      const res = await fetch(
-        `/api/recommendations?trackId=${encodeURIComponent(this.currentTrack.id)}&artist=${encodeURIComponent(this.currentTrack.artist)}`,
-        { signal: controller.signal }
-      );
-      if (res.ok) {
-        const data = await res.json();
-        if (controller.signal.aborted || generation !== this.playbackGeneration) return;
-        const recs: Track[] = data.tracks || [];
-        if (recs.length > 0) {
-          this.queue.appendTracks(recs);
-          this.syncStore({ queue: this.queue.getRawQueue() });
-          const next = this.queue.advance();
-          if (next) {
-            this.currentTrack = next;
-            await this.loadAndPlayCurrentTrack();
-            return;
-          }
+      const response = await fetch(`/api/recommendations?trackId=${encodeURIComponent(seed.id)}&artist=${encodeURIComponent(seed.artist)}`, {
+        signal: controller.signal,
+      });
+      if (!response.ok) throw new Error(`Recommendations HTTP ${response.status}`);
+      const data = await response.json();
+      if (controller.signal.aborted || generation !== this.playbackGeneration) return;
+      this.queue.appendTracks(data.tracks || []);
+      this.syncStore({ queue: this.queue.getRawQueue() });
+      if (advanceWhenReady && this.shouldBePlaying) {
+        const next = this.queue.advance(true);
+        if (next) {
+          this.currentTrack = next;
+          this.loadAndPlayCurrentTrack();
+          return;
         }
+      } else {
+        this.prepareNextTrack();
+        return;
       }
-    } catch (e) {
-      audioLogger.warn("Autoplay fetch failed:", e);
+    } catch (error) {
+      audioLogger.warn("recommendations.failed", error);
     } finally {
       clearTimeout(timeout);
       if (this.recommendationRequest === controller) this.recommendationRequest = null;
     }
-    if (generation !== this.playbackGeneration || !this.shouldBePlaying) return;
-
-    this.shouldBePlaying = false;
-    this.syncStore({ isPlaying: false, status: "ENDED" });
-  }
-
-  private async replenishAutoplayQueue() {
-    if (!this.currentTrack || this.isPrefetchingAutoplay) return;
-    this.isPrefetchingAutoplay = true;
-    const generation = this.playbackGeneration;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 12000);
-
-    try {
-      const queueTracks = this.queue.getTracks();
-      const seedTrack = queueTracks[queueTracks.length - 1] || this.currentTrack;
-
-      const res = await fetch(
-        `/api/recommendations?trackId=${encodeURIComponent(seedTrack.id)}&artist=${encodeURIComponent(seedTrack.artist)}`,
-        { signal: controller.signal }
-      );
-      if (res.ok) {
-        const data = await res.json();
-        if (controller.signal.aborted || generation !== this.playbackGeneration) return;
-        const recs: Track[] = data.tracks || [];
-        if (recs.length > 0) {
-          this.queue.appendTracks(recs);
-          this.syncStore({ queue: this.queue.getRawQueue() });
-          audioLogger.log(`Replenished autoplay queue with ${recs.length} tracks`);
-          this.prepareNextTrack();
-        }
-      }
-    } catch (err) {
-      audioLogger.warn("Failed to replenish autoplay queue in background:", err);
-    } finally {
-      clearTimeout(timeout);
-      setTimeout(() => {
-        this.isPrefetchingAutoplay = false;
-      }, 4000);
+    if (advanceWhenReady && generation === this.playbackGeneration && this.shouldBePlaying && (!controller.signal.aborted || timedOut)) {
+      this.shouldBePlaying = false;
+      this.syncStore({ isPlaying: false, isBuffering: false, status: "ENDED" });
+      setMediaSessionPlaybackState("paused");
     }
   }
 
@@ -771,8 +762,10 @@ export class AudioManager {
     const dur = this.getEffectiveDuration();
     const curTime = this.audio.currentTime;
 
-    // Reset background tracking flag immediately
-    this.endedWhileBackgrounded = false;
+    this.trace("visibility.resume");
+    if (this.checkTrackBoundary("foreground")) return;
+    this.scheduleEndCheck();
+    if (this.recommendationRequest && this.audio.ended) return;
 
     // An unpaused element can still be waiting for network data.
     const isPlayingMidTrack = !isPaused && this.audio.readyState >= 3 && (dur === 0 || curTime < dur - 1.5);
@@ -787,16 +780,20 @@ export class AudioManager {
     }
 
     // 2. Only recover if the track has genuinely reached the end AND playback is halted
-    const trackFinished = isEnded || (dur > 2 && curTime >= dur - 0.5);
+    const trackFinished = isEnded;
 
     if (trackFinished && isPaused && this.shouldBePlaying && !this.isTransitioning) {
       audioLogger.log("recovering queue transition");
-      this.next();
+      this.handleTrackEnded();
       return;
     }
 
     if (this.shouldBePlaying && !trackFinished) {
-      this.recoverPlayback();
+      // Re-enter play synchronously on foreground without restarting an active
+      // resolver request or spending a retry just because visibility changed.
+      if (this.audio.paused) this.requestPlay();
+      if (this.recoveryDeadline && Date.now() >= this.recoveryDeadline) this.recoverPlayback();
+      else this.scheduleRecovery();
       return;
     }
 
@@ -813,51 +810,136 @@ export class AudioManager {
     if (!this.recommendationRequest) return;
     this.recommendationRequest.abort();
     this.recommendationRequest = null;
-    this.playbackGeneration++;
-    this.isTransitioning = false;
   }
 
   private clearRecoveryTimer() {
     if (this.recoveryTimer !== null) clearTimeout(this.recoveryTimer);
     this.recoveryTimer = null;
+    this.recoveryDeadline = 0;
   }
 
-  private scheduleRecovery() {
-    if (!this.shouldBePlaying || this.recoveryTimer !== null) return;
+  private scheduleRecovery(delay = STREAM_WAIT_MS) {
+    if (!this.shouldBePlaying) return;
+    const nextDeadline = Date.now() + delay;
+    if (this.recoveryTimer !== null) {
+      if (this.recoveryDeadline <= nextDeadline) return;
+      clearTimeout(this.recoveryTimer);
+      this.recoveryTimer = null;
+    }
     const generation = this.playbackGeneration;
+    this.recoveryDeadline = nextDeadline;
     this.recoveryTimer = setTimeout(() => {
       this.recoveryTimer = null;
       if (generation === this.playbackGeneration) this.recoverPlayback();
-    }, 10000);
+    }, delay);
   }
 
   private recoverPlayback() {
     if (!this.currentTrack || !this.shouldBePlaying) return;
     this.clearRecoveryTimer();
-    if (this.recoveryAttempts >= 2) {
+    if (this.checkTrackBoundary("recovery")) return;
+    this.trace("recovery.start", { attempt: this.recoveryAttempts });
+    if (this.recoveryAttempts >= 1) {
+      this.consecutiveFailures++;
+      this.trace("recovery.exhausted", { failures: this.consecutiveFailures });
+      // Skip unavailable tracks, but stop rather than loop forever through failures.
+      const next = this.queue.getNextTrack();
+      if (this.consecutiveFailures < MAX_FAILED_TRACKS && next && next.id !== this.currentTrack.id) {
+        this.playNext(true);
+        return;
+      }
       this.shouldBePlaying = false;
+      this.clearEndTimer();
+      this.playRequest++;
       this.audio.pause();
       this.syncStore({ isPlaying: false, isBuffering: false, status: "ERROR" });
       setMediaSessionPlaybackState("paused");
       return;
     }
     this.recoveryAttempts++;
-    audioLogger.warn(`Recovering playback: ${this.currentTrack.id}, attempt ${this.recoveryAttempts}`);
-    // First retry the existing element (including a complete prepared Blob).
-    // Replace a failed source only on error or after that retry has timed out.
-    if (this.audio.error || this.recoveryAttempts > 1) {
-      const position = this.audio.currentTime;
-      this.audio.src = `/api/stream/${encodeURIComponent(this.currentTrack.id)}?audio=true&refresh=1&t=${Date.now()}`;
-      if (Number.isFinite(position) && position > 0) {
-        try { this.audio.currentTime = position; } catch { /* Metadata may not be available yet. */ }
-      }
-    }
+    const position = this.audio.currentTime;
+    // Replace the failed request once; use the direct Python endpoint for YTM
+    // so its 35s opening budget matches this player's 40s watchdog.
+    this.playRequest++;
+    this.pendingSeekTime = Number.isFinite(position) && position > 0 ? position : null;
+    this.audio.src = this.getStreamUrl(this.currentTrack, true);
     this.syncStore({ isPlaying: false, isBuffering: true, status: "BUFFERING" });
     setMediaSessionPlaybackState("paused");
-    setMediaSessionPosition(this.audio.currentTime, this.getEffectiveDuration(), 1);
     this.rebindMediaSessionActions();
-    void this.audio.play().catch((err) => audioLogger.warn("Recovery play rejected:", err));
+    this.requestPlay();
     this.scheduleRecovery();
+  }
+
+  private async resolveCurrentDuration() {
+    const track = this.currentTrack;
+    if (!track || this.resolvedDuration || track.provider !== "ytm") return;
+    const generation = this.playbackGeneration;
+    const controller = new AbortController();
+    this.durationRequest = controller;
+    try {
+      const response = await fetch(`/api/resolve/${encodeURIComponent(track.id)}`, {
+        method: "POST", cache: "no-store",
+        signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]),
+      });
+      if (!response.ok) return;
+      const data = await response.json();
+      if (controller.signal.aborted || generation !== this.playbackGeneration || data.status !== "warmed" || data.trackId !== track.id) return;
+      rememberResolvedDuration(track.id, data.duration);
+      this.resolvedDuration = getResolvedDuration(track.id);
+      this.trace("duration.resolved");
+      if (this.resolvedDuration) {
+        this.syncStore({ duration: this.resolvedDuration });
+        this.scheduleEndCheck();
+      }
+    } catch (error) {
+      if (!controller.signal.aborted) audioLogger.warn("duration.resolve-failed", error);
+    } finally {
+      if (this.durationRequest === controller) this.durationRequest = null;
+    }
+  }
+
+  private clearEndTimer() {
+    if (this.endTimer !== null) clearTimeout(this.endTimer);
+    this.endTimer = null;
+  }
+
+  private checkTrackBoundary(trigger: string): boolean {
+    if (!this.shouldBePlaying || !this.hasStartedCurrentTrack || this.isTransitioning || this.audio.seeking || this.pendingSeekTime !== null) return false;
+    if (this.completedGeneration === this.playbackGeneration) return true;
+    // Resolver metadata belongs to the exact video ID. Never use a catalog-only
+    // duration or elapsed wall time: seeks and buffering make those unsafe.
+    const overrun = this.resolvedDuration !== null && Number.isFinite(this.audio.currentTime)
+      && this.audio.currentTime >= this.resolvedDuration + 2;
+    if (!this.audio.ended && !overrun) return false;
+    this.trace("boundary.fallback", { trigger });
+    this.handleTrackEnded();
+    return true;
+  }
+
+  private scheduleEndCheck() {
+    this.clearEndTimer();
+    if (!this.shouldBePlaying || !this.hasStartedCurrentTrack || !this.resolvedDuration || this.audio.seeking || this.completedGeneration === this.playbackGeneration) return;
+    const generation = this.playbackGeneration;
+    const rate = this.audio.playbackRate > 0 ? this.audio.playbackRate : 1;
+    const remainingMs = (this.resolvedDuration + 2 - this.audio.currentTime) * 1000 / rate;
+    // Re-read actual media position, never infer completion from timer expiry.
+    this.endTimer = setTimeout(() => {
+      this.endTimer = null;
+      if (generation !== this.playbackGeneration) return;
+      if (!this.checkTrackBoundary("timer")) this.scheduleEndCheck();
+    }, Math.max(500, Math.min(30000, remainingMs)));
+  }
+
+  private trace(event: string, details: Record<string, unknown> = {}) {
+    audioLogger.log(event, {
+      trackId: this.currentTrack?.id, generation: this.playbackGeneration,
+      time: this.audio?.currentTime, readyState: this.audio?.readyState,
+      networkState: this.audio?.networkState, paused: this.audio?.paused,
+      intendedPlaying: this.shouldBePlaying, ...details,
+      nativeDuration: Number.isFinite(this.audio?.duration) ? this.audio.duration : null,
+      resolvedDuration: this.resolvedDuration, catalogDuration: this.currentTrack?.duration,
+      ended: this.audio?.ended, seeking: this.audio?.seeking, playbackRate: this.audio?.playbackRate,
+    });
   }
 
   // ─── Persistence / Seek Resume ───────────────────────────────────────────
@@ -932,6 +1014,7 @@ export class AudioManager {
   // ─── Helpers ─────────────────────────────────────────────────────────────
 
   private getEffectiveDuration(): number {
+    if (this.resolvedDuration) return this.resolvedDuration;
     if (this.currentTrack?.duration && this.currentTrack.duration > 0) {
       return this.currentTrack.duration;
     }
@@ -941,8 +1024,8 @@ export class AudioManager {
     return 0;
   }
 
-  private getStreamUrl(track: Track): string {
-    const offlineUrl = getSyncOfflineTrackUrl(track.id) || getPreparedTrackUrl(track.id);
+  private getStreamUrl(track: Track, forceRefresh = false): string {
+    const offlineUrl = forceRefresh ? null : getSyncOfflineTrackUrl(track.id);
     if (offlineUrl) {
       return offlineUrl;
     }
@@ -953,10 +1036,10 @@ export class AudioManager {
 
     if (provider === "ytm") {
       const resolverBase = (process.env.NEXT_PUBLIC_RESOLVER_URL || "https://diskonsumopod.web.id").replace(/\/+$/, "");
-      return `${resolverBase}/stream?id=${encodeURIComponent(providerTrackId)}`;
+      return `${resolverBase}/stream?id=${encodeURIComponent(providerTrackId)}${forceRefresh ? "&refresh=1" : ""}`;
     }
 
-    return `/api/stream/${encodeURIComponent(track.id)}?audio=true`;
+    return `/api/stream/${encodeURIComponent(track.id)}?audio=true${forceRefresh ? "&refresh=1" : ""}`;
   }
 }
 

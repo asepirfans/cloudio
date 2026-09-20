@@ -78,6 +78,23 @@ export class QueueManager {
     return null;
   }
 
+  public getUpcomingTracks(limit: number): Track[] {
+    if (limit <= 0 || this.repeatMode === "track") return [];
+    const active = this.getTracks();
+    if (active.length <= 1) return [];
+    const upcoming: Track[] = [];
+    for (let offset = 1; offset < active.length && upcoming.length < limit; offset++) {
+      let index = this.currentIndex + offset;
+      if (index >= active.length) {
+        if (this.repeatMode !== "queue") break;
+        index %= active.length;
+      }
+      const track = active[index];
+      if (track && track.id !== this.getCurrentTrack()?.id) upcoming.push(track);
+    }
+    return upcoming;
+  }
+
   public getPreviousTrack(): Track | null {
     const active = this.getTracks();
     const prevIndex = this.currentIndex - 1;
@@ -93,8 +110,8 @@ export class QueueManager {
     return null;
   }
 
-  public advance(): Track | null {
-    if (this.repeatMode === "track") {
+  public advance(skipRepeat = false): Track | null {
+    if (!skipRepeat && this.repeatMode === "track") {
       return this.getCurrentTrack();
     }
 
@@ -197,8 +214,8 @@ export class QueueManager {
 
   public setShuffle(shuffle: boolean) {
     if (this.shuffle === shuffle) return;
-    this.shuffle = shuffle;
     const current = this.getCurrentTrack();
+    this.shuffle = shuffle;
 
     if (shuffle) {
       this.shuffledQueue = shuffleArray(this.queue);

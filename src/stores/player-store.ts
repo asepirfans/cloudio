@@ -52,9 +52,9 @@ export const usePlayerStore = create<PlayerState>()(
       },
 
       togglePlay: () => {
-        const { isPlaying, currentTrack } = get();
+        const { isPlaying, isBuffering, currentTrack } = get();
         if (!currentTrack) return;
-        if (isPlaying) {
+        if (isPlaying || isBuffering) {
           audioManager.pause();
         } else {
           audioManager.resume();

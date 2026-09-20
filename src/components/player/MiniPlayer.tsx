@@ -2,13 +2,13 @@
 import Image from "next/image";
 import { Play, Pause, ListMusic } from "lucide-react";
 import { usePlayerStore } from "@/stores/player-store";
-import { getAudio } from "@/player/audio-engine";
 import { FullPlayer } from "./FullPlayer";
 
 export function MiniPlayer() {
   const {
     currentTrack,
     isPlaying,
+    isBuffering,
     currentTime,
     duration,
     showFullPlayer,
@@ -23,14 +23,7 @@ export function MiniPlayer() {
 
   const handleTogglePlay = (e: React.MouseEvent) => {
     e.stopPropagation();
-    const audio = getAudio();
-    if (isPlaying) {
-      audio.pause();
-      usePlayerStore.getState().pause();
-    } else {
-      audio.play().catch(() => {});
-      usePlayerStore.getState().play();
-    }
+    usePlayerStore.getState().togglePlay();
   };
 
   return (
@@ -113,9 +106,9 @@ export function MiniPlayer() {
                 <button
                   onClick={handleTogglePlay}
                   className="touch-target p-2 rounded-full transition-fast shrink-0 text-primary hover:text-accent active:scale-95 touch-manipulation cursor-pointer"
-                  aria-label={isPlaying ? "Pause" : "Play"}
+                  aria-label={(isPlaying || isBuffering) ? "Pause" : "Play"}
                 >
-                  {isPlaying ? (
+                  {(isPlaying || isBuffering) ? (
                     <Pause size={22} strokeWidth={2} aria-hidden="true" />
                   ) : (
                     <Play size={22} strokeWidth={2} aria-hidden="true" />

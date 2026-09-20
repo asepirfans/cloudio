@@ -22,6 +22,7 @@ import { useOfflineStorage } from "@/hooks/useOfflineStorage";
 import { usePlayerStore } from "@/stores/player-store";
 import { playTrackDirectly } from "@/player/audio-engine";
 import { formatBytes } from "@/services/offline-storage";
+import { AudioDiagnostics } from "@/components/player/AudioDiagnostics";
 import { TrackRow } from "@/components/track/TrackRow";
 import type { Track } from "@/types/music";
 
@@ -127,6 +128,7 @@ export function LibraryClient() {
 
   return (
     <div className="w-full max-w-2xl mx-auto px-4 pt-[max(1rem,env(safe-area-inset-top))] md:pt-6 pb-24 overflow-x-hidden">
+      <AudioDiagnostics />
       {/* If viewing a single playlist */}
       {selectedPlaylist ? (
         <div className="space-y-5 animate-in fade-in duration-200">

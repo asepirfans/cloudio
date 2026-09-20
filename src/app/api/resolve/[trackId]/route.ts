@@ -39,7 +39,8 @@ async function handleResolve(
     const resolverBase = (process.env.RESOLVER_SERVICE_URL || "https://diskonsumopod.web.id").replace(/\/+$/, "");
 
     if (provider === "ytm" && resolverBase) {
-      const res = await fetch(`${resolverBase}/resolve?id=${encodeURIComponent(providerTrackId)}`, {
+      const res = await fetch(`${resolverBase}/resolve?id=${encodeURIComponent(providerTrackId)}${searchParams.get("refresh") === "1" ? "&refresh=1" : ""}`, {
+        cache: "no-store",
         signal: AbortSignal.timeout(15000),
       });
       if (res.ok) {
@@ -49,8 +50,10 @@ async function handleResolve(
           trackId: decoded,
           url: data.url,
           duration: data.duration,
+          expiresAt: data.expiresAt,
         });
       }
+      return NextResponse.json({ status: "error", trackId: decoded }, { status: res.status });
     } else if (provider === "audius") {
       const source = await audiusProvider.getStream(providerTrackId);
       if (source?.url) {
@@ -62,11 +65,11 @@ async function handleResolve(
       }
     }
 
-    return NextResponse.json({ status: "acknowledged", trackId: decoded });
+    return NextResponse.json({ status: "unavailable", trackId: decoded }, { status: 404 });
   } catch (err: any) {
     return NextResponse.json(
       { status: "error", message: err?.message || "Resolver pre-warm timeout" },
-      { status: 200 }
+      { status: 502 }
     );
   }
 }

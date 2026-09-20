@@ -9,21 +9,22 @@ interface CachedStream {
   mimeType: string;
   itag: number;
   duration?: number;
-  cachedAt: number;
+  expiresAt: number;
 }
 
 const streamCache = new Map<string, CachedStream>();
 
 async function getStreamUrlForYtm(videoId: string, forceRefresh = false): Promise<{ url: string; duration?: number } | null> {
   const cached = streamCache.get(videoId);
-  if (!forceRefresh && cached && Date.now() - cached.cachedAt < 2 * 60 * 60 * 1000) {
+  if (!forceRefresh && cached && Date.now() < cached.expiresAt) {
     return { url: cached.url, duration: cached.duration };
   }
 
   const resolverServiceUrl = (process.env.RESOLVER_SERVICE_URL || "https://diskonsumopod.web.id").replace(/\/+$/, "");
   if (resolverServiceUrl) {
     try {
-      const res = await fetch(`${resolverServiceUrl}/resolve?id=${encodeURIComponent(videoId)}`, {
+      const res = await fetch(`${resolverServiceUrl}/resolve?id=${encodeURIComponent(videoId)}${forceRefresh ? "&refresh=1" : ""}`, {
+        cache: "no-store",
         signal: AbortSignal.timeout(15000),
       });
       if (res.ok) {
@@ -34,7 +35,11 @@ async function getStreamUrlForYtm(videoId: string, forceRefresh = false): Promis
             mimeType: parsed.mimeType || "audio/mp4",
             itag: parsed.itag || 140,
             duration: parsed.duration,
-            cachedAt: Date.now(),
+            // The resolver signs URLs for 10 minutes, not two hours.
+            expiresAt: Math.min(
+              Date.now() + 5 * 60 * 1000,
+              parsed.expiresAt ? Number(parsed.expiresAt) * 1000 - 30000 : Date.now() + 60000
+            ),
           });
           return { url: parsed.url, duration: parsed.duration };
         }
@@ -89,7 +94,7 @@ export async function GET(
 
       const resolverBase = (process.env.RESOLVER_SERVICE_URL || "https://diskonsumopod.web.id").replace(/\/+$/, "");
       if (provider === "ytm" && resolverBase) {
-        streamFetchUrl = `${resolverBase}/stream?id=${encodeURIComponent(providerTrackId)}`;
+        streamFetchUrl = `${resolverBase}/stream?id=${encodeURIComponent(providerTrackId)}${forceRefresh ? "&refresh=1" : ""}`;
       } else {
         let streamUrl: string | null = null;
         if (provider === "ytm") {
@@ -106,30 +111,46 @@ export async function GET(
         streamFetchUrl = streamUrl;
       }
 
-      let streamRes = await fetch(streamFetchUrl, {
-        headers: forwardHeaders,
-      });
+      const fetchAudio = async (url: string) => {
+        const controller = new AbortController();
+        // Limit only the wait for headers, not the duration of the song.
+        const timer = setTimeout(() => controller.abort(), 40000);
+        try {
+          return await fetch(url, {
+            headers: forwardHeaders,
+            cache: "no-store",
+            signal: AbortSignal.any([req.signal, controller.signal]),
+          });
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+      let streamRes = await fetchAudio(streamFetchUrl);
 
       // Upstream recovery: If audio fetch failed, clear cache and retry once with force-refresh
-      if (!streamRes.ok && streamRes.status !== 206 && provider === "ytm") {
+      if ([401, 403, 404, 410, 502].includes(streamRes.status) && provider === "ytm") {
         console.warn(`[API /stream] Upstream audio fetch failed (${streamRes.status}), retrying...`);
+        await streamRes.body?.cancel();
         streamCache.delete(providerTrackId);
         if (resolverBase) {
-          streamFetchUrl = `${resolverBase}/stream?id=${encodeURIComponent(providerTrackId)}`;
+          streamFetchUrl = `${resolverBase}/stream?id=${encodeURIComponent(providerTrackId)}&refresh=1`;
         } else {
           const retryResolved = await getStreamUrlForYtm(providerTrackId, true);
           if (retryResolved?.url) {
             streamFetchUrl = retryResolved.url;
           }
         }
-        streamRes = await fetch(streamFetchUrl, { headers: forwardHeaders });
+        streamRes = await fetchAudio(streamFetchUrl);
       }
 
       const responseHeaders = new Headers();
       responseHeaders.set("Content-Type", streamRes.headers.get("content-type") || "audio/mp4");
       responseHeaders.set("Accept-Ranges", "bytes");
       responseHeaders.set("Access-Control-Allow-Origin", "*");
-      responseHeaders.set("Cache-Control", "public, max-age=3600");
+      responseHeaders.set("Cache-Control", streamRes.headers.get("cache-control") || "private, no-store");
+      if (streamRes.headers.has("retry-after")) {
+        responseHeaders.set("Retry-After", streamRes.headers.get("retry-after")!);
+      }
 
       if (streamRes.headers.get("content-range")) {
         responseHeaders.set("Content-Range", streamRes.headers.get("content-range")!);

@@ -16,7 +16,6 @@ import {
   Search,
 } from "lucide-react";
 import { usePlayerStore } from "@/stores/player-store";
-import { getAudio } from "@/player/audio-engine";
 import { SeekBar } from "./SeekBar";
 import type { Lyrics, RepeatMode } from "@/types/music";
 
@@ -30,6 +29,7 @@ export function LyricsPanel({ onClose }: LyricsPanelProps) {
     currentTime,
     duration,
     isPlaying,
+    isBuffering,
     shuffle,
     repeatMode,
     seek,
@@ -40,14 +40,7 @@ export function LyricsPanel({ onClose }: LyricsPanelProps) {
   } = usePlayerStore();
 
   const handlePlayPause = () => {
-    const audio = getAudio();
-    if (isPlaying) {
-      audio.pause();
-      usePlayerStore.getState().pause();
-    } else {
-      audio.play().catch(() => {});
-      usePlayerStore.getState().play();
-    }
+    usePlayerStore.getState().togglePlay();
   };
 
   const nextRepeatMode = (current: RepeatMode): RepeatMode => {
@@ -484,9 +477,9 @@ export function LyricsPanel({ onClose }: LyricsPanelProps) {
               onClick={handlePlayPause}
               style={{ width: "56px", height: "56px", minWidth: "56px", minHeight: "56px" }}
               className="rounded-full bg-white text-black flex items-center justify-center shadow-xl hover:scale-105 active:scale-95 transition-all cursor-pointer shrink-0"
-              aria-label={isPlaying ? "Jeda lagu" : "Putar lagu"}
+              aria-label={(isPlaying || isBuffering) ? "Jeda lagu" : "Putar lagu"}
             >
-              {isPlaying ? (
+              {(isPlaying || isBuffering) ? (
                 <Pause size={24} className="fill-black text-black" strokeWidth={0} />
               ) : (
                 <Play size={24} className="fill-black text-black ml-1" strokeWidth={0} />
