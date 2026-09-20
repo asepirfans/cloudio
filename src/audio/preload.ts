@@ -47,6 +47,20 @@ export async function prewarmNextTrack(track: Track): Promise<boolean> {
 
     await Promise.race([directPromise, proxyPromise]);
 
+    // Pre-buffer first 256 KB of audio stream to prime upstream CDN connection and browser cache
+    try {
+      const streamRes = await fetch(`${resolverUrl}/stream?id=${encodeURIComponent(providerTrackId)}`, {
+        headers: { Range: "bytes=0-262143" },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (streamRes && (streamRes.status === 200 || streamRes.status === 206)) {
+        await streamRes.arrayBuffer();
+        audioLogger.log(`Pre-buffered first audio chunk for: ${track.id}`);
+      }
+    } catch (streamErr) {
+      // Non-fatal if chunk prefetch times out; resolver cache is already warm
+    }
+
     warmedTracks.set(track.id, now);
     audioLogger.log(`Next track prepared: ${track.id}`);
     return true;

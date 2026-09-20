@@ -39,6 +39,7 @@ export class AudioManager {
   private pendingSeekTime: number | null = null;
   private lastResumeSaveTime: number = 0;
   private isPrefetchingAutoplay: boolean = false;
+  private lastSyncedSecond: number = -1;
 
   // Store sync hook
   private storeSync: AudioManagerStoreSync | null = null;
@@ -160,14 +161,8 @@ export class AudioManager {
       const curTime = this.audio.currentTime;
       const effectiveDuration = this.getEffectiveDuration();
 
-      // Next-track prewarming: 45s before track ends
-      const remaining = effectiveDuration - curTime;
-      if (
-        Number.isFinite(remaining) &&
-        effectiveDuration > 20 &&
-        remaining <= 45 &&
-        !this.nextTrackPrepared
-      ) {
+      // Proactively prewarm next track early as soon as playback starts (at curTime >= 2)
+      if (!this.nextTrackPrepared && curTime >= 2) {
         this.nextTrackPrepared = true;
         this.prepareNextTrack();
       }
@@ -186,8 +181,9 @@ export class AudioManager {
       this.syncStore({ currentTime: curTime });
       this.saveResumeState(false);
 
-      // Periodically update lock-screen progress
-      if (Math.round(curTime) % 3 === 0) {
+      // Smooth 1-second lock-screen progress updates
+      if (Math.floor(curTime) !== this.lastSyncedSecond) {
+        this.lastSyncedSecond = Math.floor(curTime);
         setMediaSessionPosition(curTime, effectiveDuration, this.audio.playbackRate || 1);
       }
     });
@@ -298,7 +294,7 @@ export class AudioManager {
       onPause: () => this.pause(),
       onNext: () => this.next(),
       onPrevious: () => this.previous(),
-      onSeekTo: (time) => this.seek(time),
+      onSeekTo: (time, fastSeek) => this.seek(time, fastSeek),
       onSeekForward: (offset) => {
         const cur = this.audio.currentTime;
         const dur = this.getEffectiveDuration();
@@ -317,6 +313,11 @@ export class AudioManager {
     try {
       navigator.mediaSession.setActionHandler("nexttrack", () => this.next());
       navigator.mediaSession.setActionHandler("previoustrack", () => this.previous());
+      navigator.mediaSession.setActionHandler("seekto", (details) => {
+        if (details.seekTime !== undefined && Number.isFinite(details.seekTime)) {
+          this.seek(details.seekTime, Boolean(details.fastSeek));
+        }
+      });
       navigator.mediaSession.setActionHandler("seekforward", null);
       navigator.mediaSession.setActionHandler("seekbackward", null);
     } catch {
@@ -339,6 +340,11 @@ export class AudioManager {
       await this.audio.play();
       this.syncStore({ isPlaying: true });
       setMediaSessionPlaybackState("playing");
+      setMediaSessionPosition(
+        this.audio.currentTime,
+        this.getEffectiveDuration(),
+        this.audio.playbackRate || 1
+      );
     } catch (err: any) {
       audioLogger.warn("Audio play() rejected:", err?.message || err);
     }
@@ -349,18 +355,28 @@ export class AudioManager {
     this.audio.pause();
     this.syncStore({ isPlaying: false, status: "PAUSED" });
     setMediaSessionPlaybackState("paused");
+    setMediaSessionPosition(this.audio.currentTime, this.getEffectiveDuration(), 0);
   }
 
   public resume() {
     this.play();
   }
 
-  public seek(time: number) {
+  public seek(time: number, fastSeek = false) {
     if (!Number.isFinite(time)) return;
     try {
-      this.audio.currentTime = Math.max(0, time);
-      this.syncStore({ currentTime: this.audio.currentTime });
-      setMediaSessionPosition(this.audio.currentTime, this.getEffectiveDuration());
+      const targetTime = Math.max(0, time);
+      if (fastSeek && "fastSeek" in this.audio && typeof (this.audio as any).fastSeek === "function") {
+        (this.audio as any).fastSeek(targetTime);
+      } else {
+        this.audio.currentTime = targetTime;
+      }
+      this.syncStore({ currentTime: targetTime });
+      setMediaSessionPosition(
+        targetTime,
+        this.getEffectiveDuration(),
+        this.audio.paused ? 0 : (this.audio.playbackRate || 1)
+      );
     } catch (e) {
       audioLogger.warn("Seek error:", e);
     }
@@ -480,6 +496,9 @@ export class AudioManager {
     // 1. Immediately update UI & lock screen metadata
     updateMediaMetadata(track);
     setMediaSessionPlaybackState("playing");
+    if (track.duration && track.duration > 0) {
+      setMediaSessionPosition(0, track.duration, 1);
+    }
 
     this.syncStore({
       currentTrack: track,
@@ -506,6 +525,12 @@ export class AudioManager {
             audioLogger.log("audio.play() resolved");
             this.syncStore({ isPlaying: true, status: "PLAYING", isBuffering: false });
             setMediaSessionPlaybackState("playing");
+            setMediaSessionPosition(
+              this.audio.currentTime,
+              this.getEffectiveDuration(),
+              this.audio.playbackRate || 1
+            );
+            this.prepareNextTrack();
           })
           .catch((err) => {
             audioLogger.warn("audio.play() deferred:", err?.message || err);
@@ -686,6 +711,7 @@ export class AudioManager {
           this.queue.appendTracks(recs);
           this.syncStore({ queue: this.queue.getRawQueue() });
           audioLogger.log(`Replenished autoplay queue with ${recs.length} tracks`);
+          this.prepareNextTrack();
         }
       }
     } catch (err) {

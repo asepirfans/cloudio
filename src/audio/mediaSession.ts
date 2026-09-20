@@ -6,7 +6,7 @@ export interface MediaSessionActionHandlers {
   onPause: () => void;
   onNext: () => void;
   onPrevious: () => void;
-  onSeekTo: (time: number) => void;
+  onSeekTo: (time: number, fastSeek?: boolean) => void;
   onSeekForward: (offset: number) => void;
   onSeekBackward: (offset: number) => void;
   onStop?: () => void;
@@ -42,7 +42,7 @@ export function setupMediaSession(handlers: MediaSessionActionHandlers) {
 
     navigator.mediaSession.setActionHandler("seekto", (details) => {
       if (details.seekTime !== undefined && Number.isFinite(details.seekTime)) {
-        handlers.onSeekTo(details.seekTime);
+        handlers.onSeekTo(details.seekTime, Boolean(details.fastSeek));
       }
     });
 
@@ -143,7 +143,7 @@ export function setMediaSessionPosition(
   try {
     navigator.mediaSession.setPositionState({
       duration,
-      playbackRate: Number.isFinite(playbackRate) && playbackRate > 0 ? playbackRate : 1,
+      playbackRate: Number.isFinite(playbackRate) && playbackRate >= 0 ? playbackRate : 1,
       position: safePosition,
     });
   } catch (err) {
