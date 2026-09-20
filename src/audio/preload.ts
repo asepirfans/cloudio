@@ -2,82 +2,76 @@ import type { Track } from "@/types/music";
 import { isTrackOffline } from "@/services/offline-storage";
 import { audioLogger } from "./logger";
 
-// Set of warmed track IDs with timestamp
-const warmedTracks = new Map<string, number>();
-const WARM_EXPIRATION_MS = 15 * 60 * 1000; // 15 minutes
+// Keep only the playing track and its successor. A complete Blob avoids a new
+// resolver/CDN request at the background track boundary; partial fetches cannot.
+const prepared = new Map<string, string>();
+let retainedIds = new Set<string>();
+let pending: { id: string; controller: AbortController; promise: Promise<boolean> } | null = null;
+const MAX_TRACK_BYTES = 25 * 1024 * 1024;
 
-/**
- * Pre-warms the backend resolver and stream cache for the upcoming track.
- * Does NOT download the entire song to RAM Blob.
- * Only makes a lightweight Range request or resolver pre-warm request so
- * upstream CDN URLs and the first audio chunks are warm in server memory.
- */
-export async function prewarmNextTrack(track: Track): Promise<boolean> {
-  if (!track || !track.id) return false;
+export function getPreparedTrackUrl(id: string): string | null {
+  return prepared.get(id) ?? null;
+}
 
-  // If already offline in IndexedDB, playback is instantaneous anyway
-  if (isTrackOffline(track.id)) {
-    audioLogger.log(`Next track is already available offline: ${track.id}`);
-    return true;
-  }
-
-  const now = Date.now();
-  const lastWarmed = warmedTracks.get(track.id);
-  if (lastWarmed && now - lastWarmed < WARM_EXPIRATION_MS) {
-    return true; // Already warm
-  }
-
-  audioLogger.log(`Preparing next track: ${track.id} (${track.title})`);
-
-  try {
-    const parts = track.id.split(":");
-    const providerTrackId = parts.length > 1 ? parts.slice(1).join(":") : track.id;
-    const resolverUrl = (process.env.NEXT_PUBLIC_RESOLVER_URL || "https://diskonsumopod.web.id").replace(/\/+$/, "");
-
-    // Directly prime the resolver cache in background (20s timeout so pytubefix has time to finish)
-    const directPromise = fetch(`${resolverUrl}/resolve?id=${encodeURIComponent(providerTrackId)}`, {
-      signal: AbortSignal.timeout(20000),
-    }).catch(() => null);
-
-    // Also prime through Next.js proxy route
-    const proxyPromise = fetch(`/api/resolve/${encodeURIComponent(track.id)}`, {
-      method: "POST",
-      signal: AbortSignal.timeout(20000),
-    }).catch(() => null);
-
-    await Promise.race([directPromise, proxyPromise]);
-
-    // Pre-buffer first 256 KB of audio stream to prime upstream CDN connection and browser cache
-    try {
-      const streamRes = await fetch(`${resolverUrl}/stream?id=${encodeURIComponent(providerTrackId)}`, {
-        headers: { Range: "bytes=0-262143" },
-        signal: AbortSignal.timeout(10000),
-      });
-      if (streamRes && (streamRes.status === 200 || streamRes.status === 206)) {
-        await streamRes.arrayBuffer();
-        audioLogger.log(`Pre-buffered first audio chunk for: ${track.id}`);
-      }
-    } catch (streamErr) {
-      // Non-fatal if chunk prefetch times out; resolver cache is already warm
+export function retainPreparedTracks(ids: string[]) {
+  retainedIds = new Set(ids);
+  if (pending && !retainedIds.has(pending.id)) pending.controller.abort();
+  for (const [id, url] of prepared) {
+    if (!retainedIds.has(id)) {
+      URL.revokeObjectURL(url);
+      prepared.delete(id);
     }
-
-    warmedTracks.set(track.id, now);
-    audioLogger.log(`Next track prepared: ${track.id}`);
-    return true;
-  } catch (err: any) {
-    audioLogger.warn(`Failed to prewarm next track: ${err?.message || err}`);
-    return false;
   }
 }
 
-/**
- * Clean up warmed track entries older than WARM_EXPIRATION_MS
- */
-export function purgeExpiredWarmedTracks() {
-  const now = Date.now();
-  for (const [id, ts] of warmedTracks.entries()) {
-    if (now - ts > WARM_EXPIRATION_MS) {
-      warmedTracks.delete(id);
+export function prewarmNextTrack(track: Track): Promise<boolean> {
+  if (!track?.id) return Promise.resolve(false);
+  if (isTrackOffline(track.id) || prepared.has(track.id)) return Promise.resolve(true);
+  if (pending?.id === track.id && !pending.controller.signal.aborted) return pending.promise;
+  pending?.controller.abort();
+  const controller = new AbortController();
+  const promise = prepare(track, controller);
+  pending = { id: track.id, controller, promise };
+  return promise;
+}
+
+async function prepare(track: Track, controller: AbortController): Promise<boolean> {
+  const timeout = setTimeout(() => controller.abort(), 60000);
+  try {
+    const resolver = (process.env.NEXT_PUBLIC_RESOLVER_URL || "https://diskonsumopod.web.id").replace(/\/+$/, "");
+    const url = track.provider === "ytm"
+      ? `${resolver}/stream?id=${encodeURIComponent(track.providerTrackId)}`
+      : `/api/stream/${encodeURIComponent(track.id)}?audio=true`;
+    const response = await fetch(url, { signal: controller.signal });
+    // Never treat an error, empty body or partial response as a playable file.
+    if (response.status !== 200 || !response.body) throw new Error("Incomplete audio response");
+    const type = response.headers.get("content-type")?.split(";")[0] || "";
+    if (!type.startsWith("audio/") && type !== "application/octet-stream" && type !== "video/mp4") {
+      throw new Error("Unexpected audio content type");
     }
+    const expectedSize = Number(response.headers.get("content-length")) || 0;
+    if (expectedSize > MAX_TRACK_BYTES) throw new Error("Track exceeds preparation limit");
+    const reader = response.body.getReader();
+    const chunks: ArrayBuffer[] = [];
+    let size = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_TRACK_BYTES) throw new Error("Track exceeds preparation limit");
+      chunks.push(value.slice().buffer);
+    }
+    if (!size || (expectedSize > 0 && size !== expectedSize)) throw new Error("Truncated audio");
+    if (controller.signal.aborted || !retainedIds.has(track.id)) return false;
+    prepared.set(track.id, URL.createObjectURL(new Blob(chunks, { type })));
+    audioLogger.log(`Prepared complete next track: ${track.id}`);
+    return true;
+  } catch (error) {
+    controller.abort();
+    audioLogger.warn(`Track preparation failed: ${track.id}`, error);
+    return false;
+  } finally {
+    clearTimeout(timeout);
+    if (pending?.controller === controller) pending = null;
   }
 }

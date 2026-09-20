@@ -143,7 +143,7 @@ export function setMediaSessionPosition(
   try {
     navigator.mediaSession.setPositionState({
       duration,
-      playbackRate: Number.isFinite(playbackRate) && playbackRate >= 0 ? playbackRate : 1,
+      playbackRate: Number.isFinite(playbackRate) && playbackRate > 0 ? playbackRate : 1,
       position: safePosition,
     });
   } catch (err) {
