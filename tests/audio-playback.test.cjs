@@ -23,7 +23,81 @@ const offline = { getSyncOfflineTrackUrl: () => null, isTrackOffline: () => fals
 const track = id => ({ id: `ytm:${id}`, provider: 'ytm', providerTrackId: id, title: id, artist: 'Artist', duration: 180 });
 const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
 
+function tick(p, ms) {
+  p.elapse(ms);
+  const [id, fn] = p.timers.entries().next().value;
+  p.timers.delete(id);
+  fn();
+}
+
+function tail(p, position = 201.9, end = 202) {
+  p.audio.currentTime = position;
+  p.audio.buffered = { length: 1, start: () => 0, end: () => end };
+  p.audio.emit('timeupdate');
+}
+
+test('buffered verified tail with missing ended advances once after no progress', () => {
+  const p = player(202);
+  p.manager.setQueue([track('a'), track('b'), track('c')]);
+  p.audio.emit('playing');
+  tail(p);
+  tick(p, 5000);
+  assert.equal(p.state.currentTrack.id, 'ytm:a');
+  tick(p, 7000);
+  assert.equal(p.state.currentTrack.id, 'ytm:b');
+  for (const fn of p.audio.handlers.ended) fn();
+  assert.equal(p.state.currentTrack.id, 'ytm:b');
+  p.manager.pause();
+});
+
+test('tail fallback does not skip an unbuffered tail or catalog-only duration', () => {
+  for (const duration of [202, null]) {
+    const p = player(duration);
+    p.manager.setQueue([track('a'), track('b')]);
+    p.audio.emit('playing');
+    tail(p, 201.9, duration ? 201.9 : 202);
+    tick(p, 12000);
+    assert.equal(p.state.currentTrack.id, 'ytm:a');
+    p.manager.pause();
+  }
+});
+
+test('tail fallback respects pause, active seek, continuing progress, and repeat', () => {
+  for (const action of ['pause', 'seek', 'progress', 'repeat']) {
+    const p = player(202);
+    p.manager.setQueue([track('a'), track('b')]);
+    p.audio.emit('playing');
+    tail(p);
+    if (action === 'pause') { p.manager.pause(); p.elapse(12000); }
+    if (action === 'seek') { p.audio.seeking = true; p.audio.emit('seeking'); p.elapse(12000); }
+    if (action === 'progress') { p.audio.currentTime = 202; tick(p, 12000); }
+    if (action === 'repeat') { p.manager.setRepeatMode('track'); tick(p, 12000); }
+    p.audio.emit('timeupdate');
+    assert.equal(p.state.currentTrack.id, 'ytm:a');
+    if (action === 'repeat') assert.equal(p.audio.currentTime, 0);
+    p.manager.pause();
+  }
+});
+
+test('silent mid-track hang refreshes without skipping even without duration or media events', () => {
+  const p = player();
+  p.manager.setQueue([track('a'), track('b')]);
+  p.audio.emit('playing');
+  p.audio.currentTime = 100;
+  tick(p, 60000); // delayed callback sees progress, so does not retry
+  assert.equal(p.manager.recoveryAttempts, 0);
+  tick(p, 40000);
+  assert.equal(p.state.currentTrack.id, 'ytm:a');
+  assert.ok(p.audio.src.includes('refresh=1'));
+  assert.equal(p.manager.pendingSeekTime, 100);
+  p.audio.emit('stalled');
+  assert.equal(p.delays.at(-1), 40000);
+  p.manager.pause();
+});
+
 function player(verifiedDuration = null) {
+  let now = 100000;
+  class Clock extends Date { static now() { return now; } }
   const timers = new Map();
   let timerId = 0;
   class Audio {
@@ -41,6 +115,7 @@ function player(verifiedDuration = null) {
   const document = { visibilityState: 'hidden', body: { contains: () => true }, addEventListener() {} };
   const window = { addEventListener() {}, location: { href: 'https://example.test/' } };
   const controls = {};
+  let mediaSessionRegistrations = 0;
   const warmed = [];
   const metadataWarmed = [];
   const delays = [];
@@ -51,19 +126,20 @@ function player(verifiedDuration = null) {
       prewarmNextTrack: async track => { warmed.push(track.id); return true; },
       prewarmTrackMetadata: async track => { metadataWarmed.push(track.id); return true; },
       retainPreparedTracks() {}, getResolvedDuration: () => verifiedDuration,
+      getPreparedTrackUrl: () => null,
       rememberResolvedDuration: (id, duration) => { verifiedDuration = duration; },
     },
-    './mediaSession': { setupMediaSession: handlers => Object.assign(controls, handlers), updateMediaMetadata() {}, setMediaSessionPlaybackState() {}, setMediaSessionPosition() {} },
+    './mediaSession': { setupMediaSession: handlers => { mediaSessionRegistrations++; Object.assign(controls, handlers); }, updateMediaMetadata() {}, setMediaSessionPlaybackState() {}, setMediaSessionPosition() {} },
     './logger': logger,
     '@/services/offline-storage': offline,
   }, {
-    window, document, navigator: {}, Audio, localStorage: { removeItem() {}, setItem() {} },
+    window, document, navigator: {}, Audio, Date: Clock, localStorage: { removeItem() {}, setItem() {} },
     setTimeout: (fn, ms) => { delays.push(ms); timers.set(++timerId, fn); return timerId; }, clearTimeout: id => timers.delete(id),
     fetch: (url, options) => new Promise(resolve => { request = { resolve, signal: options?.signal }; }),
   }).audioManager;
   manager.setStoreSync({ setState: partial => Object.assign(state, partial), getState: () => state });
   manager.setAutoplay(false);
-  return { manager, state, controls, timers, document, warmed, metadataWarmed, delays, audio: window.__cloudbeats_audio__, request: () => request };
+  return { manager, state, controls, timers, document, warmed, metadataWarmed, delays, elapse: ms => { now += ms; }, mediaSessionRegistrations: () => mediaSessionRegistrations, audio: window.__cloudbeats_audio__, request: () => request };
 }
 
 test('loading stays distinct from playing; next begins synchronously and warms its successor', async () => {
@@ -135,14 +211,53 @@ test('stalled loading has bounded recovery; foreground retries paused audio', ()
   assert.equal(p.timers.size, 0);
 });
 
-test('stalled media shortens the initial recovery deadline', () => {
+test('stalled during opening preserves the full resolver budget', () => {
   const p = player();
   p.manager.setQueue([track('a')]);
   assert.equal(p.delays.at(-1), 40000);
   p.audio.emit('stalled');
-  assert.equal(p.delays.at(-1), 12000);
+  assert.equal(p.delays.at(-1), 40000);
   assert.equal(p.timers.size, 1);
   p.manager.pause();
+});
+
+test('waiting during opening keeps resolver budget; active buffering uses stall budget', () => {
+  const p = player();
+  p.manager.setQueue([track('a'), track('b')]);
+  p.audio.emit('waiting');
+  assert.equal(p.delays.at(-1), 40000);
+  p.audio.emit('playing');
+  p.audio.emit('waiting');
+  assert.equal(p.delays.at(-1), 12000);
+  p.manager.pause();
+});
+
+test('stuck playback re-registers every lock-screen action before recovery', () => {
+  const p = player();
+  p.manager.setQueue([track('a'), track('b')]);
+  const before = p.mediaSessionRegistrations();
+  p.audio.emit('waiting');
+  assert.ok(p.mediaSessionRegistrations() > before);
+  p.controls.onNext();
+  assert.equal(p.state.currentTrack.id, 'ytm:b');
+  const afterNext = p.mediaSessionRegistrations();
+  p.audio.emit('stalled');
+  assert.ok(p.mediaSessionRegistrations() > afterNext);
+  p.manager.pause();
+});
+
+test('foreground near catalog or native duration cannot skip an unfinished song', () => {
+  for (const duration of [null, 202]) {
+    const p = player(duration);
+    p.manager.setQueue([track('a'), track('b')]);
+    p.audio.emit('playing');
+    p.audio.duration = duration || 180;
+    p.audio.currentTime = p.audio.duration - 0.2;
+    p.audio.paused = true;
+    p.manager.reconcileBackgroundState();
+    assert.equal(p.state.currentTrack.id, 'ytm:a');
+    p.manager.pause();
+  }
 });
 
 test('Media Session never receives an invalid zero playback rate', () => {
@@ -152,6 +267,21 @@ test('Media Session never receives an invalid zero playback rate', () => {
   });
   media.setMediaSessionPosition(2, 180, 0);
   assert.equal(position.playbackRate, 1);
+});
+
+test('Media Session maps iOS seek buttons to previous and next tracks', () => {
+  const actions = {};
+  const calls = [];
+  const media = load('src/audio/mediaSession.ts', { './logger': logger }, {
+    window: {}, navigator: { mediaSession: { setActionHandler: (name, handler) => { actions[name] = handler; } } },
+  });
+  media.setupMediaSession({
+    onPlay() {}, onPause() {}, onNext: () => calls.push('next'), onPrevious: () => calls.push('previous'),
+    onSeekTo() {}, onSeekForward() {}, onSeekBackward() {},
+  });
+  actions.seekforward();
+  actions.seekbackward();
+  assert.deepEqual(calls, ['next', 'previous']);
 });
 
 test('queued lock-screen navigation burst loads only one new source', () => {
@@ -251,34 +381,39 @@ function warmer(fetch) {
   return load('src/audio/preload.ts', { './logger': logger, '@/services/offline-storage': offline }, { fetch });
 }
 const resolved = () => Response.json({ status: 'warmed', url: 'https://resolver.test/stream' });
-const prefix = () => new Response('abcd', { status: 206, headers: { 'Content-Type': 'audio/mp4', 'Content-Range': 'bytes 0-3/100' } });
+const preparedAudio = range => range === 'bytes=0-0'
+  ? new Response('a', { status: 206, headers: { 'Content-Type': 'audio/mp4', 'Content-Range': 'bytes 0-0/4' } })
+  : new Response('abcd', { status: 206, headers: { 'Content-Type': 'audio/mp4', 'Content-Range': 'bytes 0-3/4' } });
 
-test('prewarm resolves then reads a bounded prefix once, without creating a Blob', async () => {
+test('prewarm resolves and retains one complete local audio URL', async () => {
   const calls = [];
   const preload = warmer(async (url, options) => {
     calls.push({ url, options });
-    return calls.length === 1 ? resolved() : prefix();
+    return calls.length === 1 ? resolved() : preparedAudio(options.headers.Range);
   });
   preload.retainPreparedTracks(['ytm:b']);
   const first = preload.prewarmNextTrack(track('b'));
   assert.equal(preload.prewarmNextTrack(track('b')), first);
   assert.equal(await first, true);
   assert.equal(await preload.prewarmNextTrack(track('b')), true);
-  assert.equal(calls.length, 2);
-  assert.equal(calls[1].options.headers.Range, 'bytes=0-524287');
+  assert.equal(calls.length, 3);
+  assert.equal(calls[1].options.headers.Range, 'bytes=0-0');
+  assert.equal(calls[2].options.headers.Range, 'bytes=0-3');
+  assert.ok(preload.getPreparedTrackUrl('ytm:b').startsWith('blob:'));
 });
 
-test('ignored Range is cancelled rather than fully downloaded or marked warm', async () => {
-  let cancelled = false;
+test('dropping a prepared track revokes its local URL', async () => {
   let count = 0;
-  const preload = warmer(async () => ++count === 1 ? resolved() : new Response(new ReadableStream({ cancel() { cancelled = true; } }), { status: 200 }));
+  const preload = warmer(async (url, options) => ++count === 1 ? resolved() : preparedAudio(options.headers.Range));
   preload.retainPreparedTracks(['ytm:b']);
-  assert.equal(await preload.prewarmNextTrack(track('b')), false);
-  assert.equal(cancelled, true);
+  assert.equal(await preload.prewarmNextTrack(track('b')), true);
+  assert.ok(preload.getPreparedTrackUrl('ytm:b'));
+  preload.retainPreparedTracks(['ytm:c']);
+  assert.equal(preload.getPreparedTrackUrl('ytm:b'), null);
 });
 
-test('prewarm rejects errors and truncated ranges, with failure cooldown', async () => {
-  for (const response of [new Response('', { status: 502 }), new Response('abc', { status: 206, headers: { 'content-type': 'audio/mp4', 'content-range': 'bytes 0-9/100' } })]) {
+test('prewarm rejects errors and truncated downloads, with failure cooldown', async () => {
+  for (const response of [new Response('', { status: 502 }), new Response('abc', { status: 200, headers: { 'content-type': 'audio/mp4', 'content-length': '10' } })]) {
     let count = 0;
     const preload = warmer(async () => ++count === 1 ? resolved() : response);
     preload.retainPreparedTracks(['ytm:b']);
@@ -315,7 +450,7 @@ test('preparation survives when next track becomes current', async () => {
   assert.equal(await preparingB, false);
 });
 
-test('second upcoming track resolves metadata without fetching an audio prefix', async () => {
+test('second upcoming track resolves metadata without fetching audio', async () => {
   const calls = [];
   const preload = warmer(async (url, options) => {
     calls.push({ url, options });
@@ -368,11 +503,11 @@ test('foreground while resolver is still loading does not spend a retry or repla
   p.manager.pause();
 });
 
-test('overlarge Range responses are cancelled before reading their bodies', async () => {
+test('overlarge prepared responses are cancelled before reading their bodies', async () => {
   let cancelled = false;
   let count = 0;
   const preload = warmer(async () => ++count === 1 ? resolved() : new Response(new ReadableStream({ cancel() { cancelled = true; } }), {
-    status: 206, headers: { 'content-type': 'audio/mp4', 'content-range': 'bytes 0-999999/2000000' },
+    status: 206, headers: { 'content-type': 'audio/mp4', 'content-range': `bytes 0-0/${25 * 1024 * 1024}` },
   }));
   preload.retainPreparedTracks(['ytm:b']);
   assert.equal(await preload.prewarmNextTrack(track('b')), false);

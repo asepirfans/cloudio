@@ -1,4 +1,4 @@
-const CACHE_NAME = "cloudio-v6";
+const CACHE_NAME = "cloudio-v7";
 
 const PRECACHE_ASSETS = [
   "/",

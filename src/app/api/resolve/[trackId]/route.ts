@@ -41,7 +41,7 @@ async function handleResolve(
     if (provider === "ytm" && resolverBase) {
       const res = await fetch(`${resolverBase}/resolve?id=${encodeURIComponent(providerTrackId)}${searchParams.get("refresh") === "1" ? "&refresh=1" : ""}`, {
         cache: "no-store",
-        signal: AbortSignal.timeout(15000),
+        signal: AbortSignal.timeout(25000),
       });
       if (res.ok) {
         const data = await res.json();

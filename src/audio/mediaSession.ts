@@ -46,11 +46,18 @@ export function setupMediaSession(handlers: MediaSessionActionHandlers) {
       }
     });
 
-    // Explicitly nullify seekforward and seekbackward so iOS Safari / WebKit lock screen
-    // displays the standard [⏮ Previous Track] and [⏭ Next Track] buttons instead of the circular +/- 10s buttons!
+    // iOS may render +/- 10s controls even when nexttrack/previoustrack are
+    // registered. The lock-screen layout is owned by WebKit, so make those
+    // fallback actions behave as track navigation for this music player.
     try {
-      navigator.mediaSession.setActionHandler("seekforward", null);
-      navigator.mediaSession.setActionHandler("seekbackward", null);
+      navigator.mediaSession.setActionHandler("seekforward", () => {
+        audioLogger.log("MediaSession action: seekforward-as-nexttrack");
+        handlers.onNext();
+      });
+      navigator.mediaSession.setActionHandler("seekbackward", () => {
+        audioLogger.log("MediaSession action: seekbackward-as-previoustrack");
+        handlers.onPrevious();
+      });
     } catch {
       // ignore
     }

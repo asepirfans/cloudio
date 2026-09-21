@@ -18,9 +18,11 @@ export function getResolvedDuration(id: string): number | null {
 
 const WARM_TTL_MS = 5 * 60 * 1000;
 const FAILURE_COOLDOWN_MS = 15000;
-const PREFIX_BYTES = 512 * 1024;
+const MAX_PREPARED_BYTES = 24 * 1024 * 1024;
+const PREPARED_CHUNK_BYTES = 1024 * 1024;
 const retainedIds = new Set<string>();
 const warmed = new Map<string, number>();
+const preparedUrls = new Map<string, { url: string; at: number }>();
 const failed = new Map<string, number>();
 type PendingPreparation = {
   controller: AbortController;
@@ -35,8 +37,24 @@ export function retainPreparedTracks(ids: string[]) {
   for (const [id, preparation] of pending) {
     if (!retainedIds.has(id)) preparation.controller.abort();
   }
+  for (const [id, prepared] of preparedUrls) {
+    if (!retainedIds.has(id)) {
+      URL.revokeObjectURL(prepared.url);
+      preparedUrls.delete(id);
+    }
+  }
   prune(warmed, WARM_TTL_MS);
   prune(failed, FAILURE_COOLDOWN_MS);
+}
+
+export function getPreparedTrackUrl(id: string): string | null {
+  const prepared = preparedUrls.get(id);
+  if (!prepared || Date.now() - prepared.at >= WARM_TTL_MS) {
+    if (prepared) URL.revokeObjectURL(prepared.url);
+    preparedUrls.delete(id);
+    return null;
+  }
+  return prepared.url;
 }
 
 export function prewarmNextTrack(track: Track): Promise<boolean> {
@@ -50,8 +68,7 @@ export function prewarmTrackMetadata(track: Track): Promise<boolean> {
 function startPreparation(track: Track, wantPrefix: boolean): Promise<boolean> {
   if (!track?.id || !retainedIds.has(track.id)) return Promise.resolve(false);
   if (isTrackOffline(track.id)) return Promise.resolve(true);
-  const warmedAt = warmed.get(track.id);
-  if (wantPrefix && warmedAt && Date.now() - warmedAt < WARM_TTL_MS) return Promise.resolve(true);
+  if (wantPrefix && getPreparedTrackUrl(track.id)) return Promise.resolve(true);
   if (!wantPrefix && getResolvedDuration(track.id)) return Promise.resolve(true);
   const existing = pending.get(track.id);
   if (existing && !existing.controller.signal.aborted) {
@@ -72,7 +89,6 @@ async function prepare(track: Track, preparation: PendingPreparation): Promise<b
   const { controller } = preparation;
   // Resolve (12s server budget) + prefix (35s server opening budget), with margin.
   const timeout = setTimeout(() => controller.abort(), 55000);
-  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   try {
     audioLogger.log("prewarm.start", { trackId: track.id });
     const resolved = await fetch(`/api/resolve/${encodeURIComponent(track.id)}`, {
@@ -89,41 +105,46 @@ async function prepare(track: Track, preparation: PendingPreparation): Promise<b
       return true;
     }
 
-    const resolver = (process.env.NEXT_PUBLIC_RESOLVER_URL || "https://diskonsumopod.web.id").replace(/\/+$/, "");
-    const url = track.provider === "ytm"
-      ? `${resolver}/stream?id=${encodeURIComponent(track.providerTrackId)}`
-      : `/api/stream/${encodeURIComponent(track.id)}?audio=true`;
-    const response = await fetch(url, {
-      headers: { Range: `bytes=0-${PREFIX_BYTES - 1}` },
-      signal: controller.signal, cache: "no-store",
+    // Full responses from YouTube are content-paced and can take the duration of
+    // the song to finish. Same-origin range chunks bypass that pacing, as used by
+    // the proven offline downloader, while keeping this buffer memory-only.
+    const url = `/api/stream/${encodeURIComponent(track.id)}?audio=true`;
+    const probe = await fetch(url, {
+      headers: { Range: "bytes=0-0" }, signal: controller.signal, cache: "no-store",
     });
-    // If Range is ignored, cancel without consuming a full song.
-    if (response.status !== 206 || !response.body) {
-      await response.body?.cancel();
-      throw new Error(`Prefix requires HTTP 206 (got ${response.status})`);
+    const range = /^bytes 0-0\/(\d+)$/.exec(probe.headers.get("content-range") || "");
+    const totalBytes = range ? Number(range[1]) : 0;
+    const type = probe.headers.get("content-type") || "";
+    await probe.body?.cancel();
+    if (probe.status !== 206 || !totalBytes || totalBytes > MAX_PREPARED_BYTES || !/^(audio\/|video\/mp4|application\/octet-stream)/.test(type)) {
+      throw new Error("Invalid or oversized prepared audio probe");
     }
-    const range = /^bytes 0-(\d+)\/(\d+|\*)$/.exec(response.headers.get("content-range") || "");
-    const size = range ? Number(range[1]) + 1 : 0;
-    const type = response.headers.get("content-type") || "";
-    if (!size || size > PREFIX_BYTES || !/^(audio\/|video\/mp4|application\/octet-stream)/.test(type)) {
-      await response.body.cancel();
-      throw new Error("Invalid audio prefix response");
-    }
-    reader = response.body.getReader();
+    const chunks: ArrayBuffer[] = [];
     let received = 0;
-    while (received < size) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      received += value.byteLength;
-      if (received > size) throw new Error("Prefix exceeded declared range");
+    for (let start = 0; start < totalBytes; start += PREPARED_CHUNK_BYTES) {
+      const end = Math.min(start + PREPARED_CHUNK_BYTES - 1, totalBytes - 1);
+      const response = await fetch(url, {
+        headers: { Range: `bytes=${start}-${end}` }, signal: controller.signal, cache: "no-store",
+      });
+      const chunkRange = response.headers.get("content-range") || "";
+      if (response.status !== 206 || chunkRange !== `bytes ${start}-${end}/${totalBytes}`) {
+        await response.body?.cancel();
+        throw new Error(`Invalid prepared audio range ${start}-${end}`);
+      }
+      const chunk = await response.arrayBuffer();
+      if (chunk.byteLength !== end - start + 1) throw new Error("Truncated prepared audio chunk");
+      chunks.push(chunk);
+      received += chunk.byteLength;
     }
-    if (received !== size) throw new Error("Truncated audio prefix");
+    if (received !== totalBytes) throw new Error("Truncated prepared audio");
     if (controller.signal.aborted || !retainedIds.has(track.id)) return false;
+    const previous = preparedUrls.get(track.id);
+    if (previous) URL.revokeObjectURL(previous.url);
+    const preparedUrl = URL.createObjectURL(new Blob(chunks, { type }));
+    preparedUrls.set(track.id, { url: preparedUrl, at: Date.now() });
     warmed.set(track.id, Date.now());
     failed.delete(track.id);
-    // This warms the resolver/upstream only. no-store means these bytes are not
-    // a reusable HTMLAudioElement buffer, and we never retain a Blob.
-    audioLogger.log("prewarm.warm", { trackId: track.id, bytes: received });
+    audioLogger.log("prewarm.ready", { trackId: track.id, bytes: received });
     return true;
   } catch (error) {
     if (!controller.signal.aborted && retainedIds.has(track.id)) {
@@ -133,7 +154,6 @@ async function prepare(track: Track, preparation: PendingPreparation): Promise<b
     return false;
   } finally {
     clearTimeout(timeout);
-    await reader?.cancel().catch(() => {});
     controller.abort();
     if (pending.get(track.id)?.controller === controller) pending.delete(track.id);
   }

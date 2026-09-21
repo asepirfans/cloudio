@@ -25,6 +25,11 @@ try:
 except ImportError:
     VideoUnavailable = None
 
+try:
+    async_timeout_scope = asyncio.timeout
+except AttributeError:
+    from async_timeout import timeout as async_timeout_scope
+
 load_dotenv()
 
 # =========================================================
@@ -57,10 +62,10 @@ STREAM_TOKEN_TTL = int(os.getenv("STREAM_TOKEN_TTL", "600"))   # 10 menit
 STREAM_CACHE_TTL = int(os.getenv("STREAM_CACHE_TTL", "1800"))  # 30 menit
 FORCE_IPV4 = os.getenv("FORCE_IPV4", "true").lower() == "true"
 
-RESOLVE_TIMEOUT = float(os.getenv("RESOLVE_TIMEOUT", "12"))
+RESOLVE_TIMEOUT = float(os.getenv("RESOLVE_TIMEOUT", "20"))
 STREAM_OPEN_TIMEOUT = float(os.getenv("STREAM_OPEN_TIMEOUT", "35"))
 UPSTREAM_READ_TIMEOUT = os.getenv("UPSTREAM_READ_TIMEOUT")
-RESOLVE_WORKERS = max(4, int(os.getenv("RESOLVE_WORKERS", "8")))
+RESOLVE_WORKERS = max(8, int(os.getenv("RESOLVE_WORKERS", "24")))
 resolver_executor = ThreadPoolExecutor(max_workers=RESOLVE_WORKERS, thread_name_prefix="resolve")
 resolver_slots = threading.BoundedSemaphore(RESOLVE_WORKERS)
 inflight: dict[str, asyncio.Task] = {}
@@ -91,9 +96,28 @@ if FORCE_IPV4:
 http_client: httpx.AsyncClient = None  # type: ignore
 
 
+# =========================================================
+# LOG FILTER (Saring spam bot scanner WordPress / .env)
+# =========================================================
+
+class ScannerNoiseFilter(logging.Filter):
+    NOISE_KEYWORDS = (
+        "wp-", "xmlrpc", ".env", ".git", "wlwmanifest", ".php",
+        "/blog", "/wordpress", "/website", "/cms", "/shop", "favicon.ico",
+        "/sito", "/news", "/test", "/media", "/site", "/app", "/backend", "/functions"
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not any(keyword in msg for keyword in self.NOISE_KEYWORDS)
+
+logging.getLogger("uvicorn.access").addFilter(ScannerNoiseFilter())
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client
+    logging.getLogger("uvicorn.access").addFilter(ScannerNoiseFilter())
     # pytubefix uses urllib's default socket timeout, independently of HTTPX.
     previous_socket_timeout = socket.getdefaulttimeout()
     socket.setdefaulttimeout(float(os.getenv("PYTUBE_SOCKET_TIMEOUT", "8")))
@@ -326,6 +350,7 @@ def _try_client(youtube_url: str, client_name: str) -> dict:
         "itag": selected.itag,
         "title": yt.title,
         "duration": yt.length,
+        "client": client_name,
     }
 
 
@@ -347,8 +372,9 @@ async def resolve_uncached(video_id: str) -> dict:
     pending = set()
     errors = []
     try:
-        async with asyncio.timeout(RESOLVE_TIMEOUT):
-            for client in ["MWEB", "ANDROID", "IOS", "WEB"]:
+        async with async_timeout_scope(RESOLVE_TIMEOUT):
+            clients = ["VISION_OS", "ANDROID_VR"]
+            for client in clients:
                 pending.add(submit_client(f"https://www.youtube.com/watch?v={video_id}", client))
             while pending:
                 done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
@@ -363,7 +389,7 @@ async def resolve_uncached(video_id: str) -> dict:
                     set_cached_stream(video_id, result)
                     return result
                 # One client's unavailable result does not rule out other clients.
-    except TimeoutError as exc:
+    except (asyncio.TimeoutError, TimeoutError) as exc:
         raise HTTPException(status_code=504, detail="Audio resolution timed out") from exc
     finally:
         for future in pending:
@@ -371,7 +397,7 @@ async def resolve_uncached(video_id: str) -> dict:
         await asyncio.gather(*pending, return_exceptions=True)
 
     # Cache only an unavailable verdict agreed on by every attempted client.
-    if len(errors) == 4 and all(is_not_available_error(error) for error in errors):
+    if len(errors) == len(clients) and all(is_not_available_error(error) for error in errors):
         detail = "Video not available in your region or has been removed"
         set_error_cache(video_id, 404, detail)
         raise HTTPException(status_code=404, detail=detail)
@@ -379,29 +405,27 @@ async def resolve_uncached(video_id: str) -> dict:
 
 
 async def resolve_in_thread(video_id: str, force_refresh: bool = False) -> dict:
-    # All concurrent callers, including refresh requests, share the active job.
+    if force_refresh:
+        with cache_lock:
+            cache.pop(video_id, None)
+            error_cache.pop(video_id, None)
+
     task = inflight.get(video_id)
     if task is None:
         if not force_refresh:
             cached = get_cached_stream(video_id)
             if cached:
                 return cached
-        else:
-            with cache_lock:
-                cache.pop(video_id, None)
-                error_cache.pop(video_id, None)
         task = asyncio.create_task(resolve_uncached(video_id))
         inflight[video_id] = task
 
         def finished(completed):
             if inflight.get(video_id) is completed:
                 inflight.pop(video_id, None)
-            # Retrieve errors even when every HTTP client has disconnected.
             if not completed.cancelled():
                 completed.exception()
 
         task.add_done_callback(finished)
-    # A cancelled preload must not cancel another listener's playback request.
     return await asyncio.shield(task)
 
 
@@ -409,8 +433,8 @@ async def resolve_in_thread(video_id: str, force_refresh: bool = False) -> dict:
 # HEALTH
 # =========================================================
 
-@app.get("/")
-@app.get("/health")
+@app.api_route("/", methods=["GET", "HEAD"])
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     return {"status": "ok", "service": "cloudio-resolver", "version": "1.1.2"}
 
@@ -481,33 +505,47 @@ async def proxy_audio_stream(
     upstream = None
     try:
         # Bound the entire opening phase, including resolves and retries.
-        async with asyncio.timeout(STREAM_OPEN_TIMEOUT):
+        async with async_timeout_scope(STREAM_OPEN_TIMEOUT):
             data = await resolve_in_thread(video_id, force_refresh=refresh)
-            for attempt in range(2):
+            for attempt in range(3):
+                # Match User-Agent to the client that resolved the URL to prevent 403 Forbidden from Google CDN
+                client_name = data.get("client", "VISION_OS")
+                if client_name == "ANDROID_VR":
+                    upstream_headers["User-Agent"] = "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+                else:
+                    upstream_headers["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15"
+
                 try:
                     req = http_client.build_request(request.method, data["url"], headers=upstream_headers)
                     upstream = await http_client.send(req, stream=True)
-                except httpx.RequestError:
-                    if attempt == 1:
+                except httpx.RequestError as exc:
+                    logger.warning("Stream proxy attempt %d for %s failed to connect: %s", attempt, video_id, exc)
+                    if attempt == 2:
                         raise HTTPException(status_code=502, detail="Failed to connect to upstream audio CDN")
                     data = await resolve_in_thread(video_id, force_refresh=True)
                     continue
+
                 status = upstream.status_code
                 if status in (200, 206):
                     break
+
                 content_range = upstream.headers.get("content-range")
                 await upstream.aclose()
                 upstream = None
+
                 if status == 416:
                     return Response(status_code=416, headers={
                         **({"Content-Range": content_range} if content_range else {}),
                         "Cache-Control": "no-store",
                     })
-                if attempt == 0 and status in (401, 403, 404, 410):
+
+                logger.warning("Stream proxy upstream returned status %d for %s on attempt %d. Refreshing...", status, video_id, attempt)
+                if attempt < 2:
                     data = await resolve_in_thread(video_id, force_refresh=True)
                     continue
+
                 raise HTTPException(status_code=502, detail=f"Upstream returned HTTP {status}")
-    except TimeoutError as exc:
+    except (asyncio.TimeoutError, TimeoutError) as exc:
         if upstream is not None:
             await upstream.aclose()
         raise HTTPException(status_code=504, detail="Audio stream opening timed out") from exc
@@ -544,13 +582,12 @@ async def proxy_audio_stream(
     async def audio_generator():
         try:
             async for chunk in upstream.aiter_raw():
+                if await request.is_disconnected():
+                    break
                 if chunk:
                     yield chunk
-        except httpx.RequestError:
-            # Headers have already been sent: surface a broken stream rather
-            # than pretending EOF was a complete audio file. The player retries.
-            logger.warning("Upstream audio interrupted for %s", video_id)
-            raise
+        except (httpx.RequestError, asyncio.CancelledError):
+            pass
         finally:
             await upstream.aclose()
 
