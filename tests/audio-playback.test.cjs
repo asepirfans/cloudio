@@ -95,7 +95,7 @@ test('silent mid-track hang refreshes without skipping even without duration or 
   p.manager.pause();
 });
 
-function player(verifiedDuration = null) {
+function player(verifiedDuration = null, preparedUrl = () => null) {
   let now = 100000;
   class Clock extends Date { static now() { return now; } }
   const timers = new Map();
@@ -126,7 +126,7 @@ function player(verifiedDuration = null) {
       prewarmNextTrack: async track => { warmed.push(track.id); return true; },
       prewarmTrackMetadata: async track => { metadataWarmed.push(track.id); return true; },
       retainPreparedTracks() {}, getResolvedDuration: () => verifiedDuration,
-      getPreparedTrackUrl: () => null,
+      getPreparedTrackUrl: preparedUrl,
       rememberResolvedDuration: (id, duration) => { verifiedDuration = duration; },
     },
     './mediaSession': { setupMediaSession: handlers => { mediaSessionRegistrations++; Object.assign(controls, handlers); }, updateMediaMetadata() {}, setMediaSessionPlaybackState() {}, setMediaSessionPosition() {} },
@@ -243,6 +243,20 @@ test('stuck playback re-registers every lock-screen action before recovery', () 
   const afterNext = p.mediaSessionRegistrations();
   p.audio.emit('stalled');
   assert.ok(p.mediaSessionRegistrations() > afterNext);
+  p.manager.pause();
+});
+
+test('remote resume with no position progress reloads the prepared local source', () => {
+  const p = player(null, id => id === 'ytm:a' ? 'blob:prepared-a' : null);
+  p.manager.setQueue([track('a'), track('b')]);
+  p.audio.currentTime = 50;
+  p.manager.pause();
+  p.controls.onPlay();
+  const [id, verifyProgress] = Array.from(p.timers.entries()).at(-1);
+  p.timers.delete(id);
+  verifyProgress();
+  assert.equal(p.audio.src, 'blob:prepared-a');
+  assert.equal(p.manager.pendingSeekTime, 50);
   p.manager.pause();
 });
 

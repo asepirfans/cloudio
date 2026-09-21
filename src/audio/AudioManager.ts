@@ -13,6 +13,7 @@ import { getSyncOfflineTrackUrl } from "@/services/offline-storage";
 // Python allows 35s to open a stream. Give it time to return before retrying.
 const STREAM_WAIT_MS = 40000;
 const STALLED_WAIT_MS = 12000;
+const REMOTE_PROGRESS_WAIT_MS = 5000;
 const REMOTE_NAVIGATION_COOLDOWN_MS = 450;
 const MAX_FAILED_TRACKS = 3;
 const RESUME_STORAGE_KEY = "cloudbeats_playback_resume";
@@ -43,6 +44,7 @@ export class AudioManager {
   private completedGeneration = -1;
   private hasStartedCurrentTrack = false;
   private recoveryTimer: ReturnType<typeof setTimeout> | null = null;
+  private remoteProgressTimer: ReturnType<typeof setTimeout> | null = null;
   private recoveryAttempts = 0;
   private recommendationRequest: AbortController | null = null;
   private lastPrewarmTime = 0;
@@ -325,7 +327,10 @@ export class AudioManager {
 
   private setupMediaSessionHandlers() {
     setupMediaSession({
-      onPlay: () => this.play(),
+      onPlay: () => {
+        this.play();
+        this.scheduleRemoteProgressCheck();
+      },
       onPause: () => this.pause(),
       onNext: () => this.handleRemoteNavigation("next"),
       onPrevious: () => this.handleRemoteNavigation("previous"),
@@ -365,6 +370,7 @@ export class AudioManager {
     this.trace(direction === "next" ? "remote.next" : "remote.previous");
     if (direction === "next") this.next();
     else this.previous();
+    this.scheduleRemoteProgressCheck();
   }
 
   // ─── Playback Controls ───────────────────────────────────────────────────
@@ -392,6 +398,7 @@ export class AudioManager {
   public pause() {
     this.trace("control.pause");
     this.clearEndTimer();
+    this.clearRemoteProgressTimer();
     this.shouldBePlaying = false;
     this.playRequest++;
     this.cancelPendingRecommendations();
@@ -524,6 +531,7 @@ export class AudioManager {
     if (!this.currentTrack) return;
 
     this.cancelPendingRecommendations();
+    this.clearRemoteProgressTimer();
     const track = this.currentTrack;
     this.clearEndTimer();
     this.durationRequest?.abort();
@@ -825,6 +833,25 @@ export class AudioManager {
     this.recoveryDeadline = 0;
   }
 
+  private clearRemoteProgressTimer() {
+    if (this.remoteProgressTimer !== null) clearTimeout(this.remoteProgressTimer);
+    this.remoteProgressTimer = null;
+  }
+
+  private scheduleRemoteProgressCheck() {
+    this.clearRemoteProgressTimer();
+    if (!this.shouldBePlaying || !this.currentTrack) return;
+    const generation = this.playbackGeneration;
+    const position = this.audio.currentTime;
+    this.remoteProgressTimer = setTimeout(() => {
+      this.remoteProgressTimer = null;
+      if (generation !== this.playbackGeneration || !this.shouldBePlaying) return;
+      if (!this.audio.paused && this.audio.currentTime > position + 0.05) return;
+      this.trace("remote.progress-stuck", { position });
+      this.recoverPlayback();
+    }, REMOTE_PROGRESS_WAIT_MS);
+  }
+
   private scheduleRecovery(delay = STREAM_WAIT_MS) {
     if (!this.shouldBePlaying) return;
     const nextDeadline = Date.now() + delay;
@@ -871,12 +898,17 @@ export class AudioManager {
     this.pendingSeekTime = Number.isFinite(position) && position > 0 ? position : null;
     this.hasStartedCurrentTrack = false;
     this.clearEndTimer();
-    this.audio.src = this.getStreamUrl(this.currentTrack, true);
+    // A prepared/offline URL remains usable while locked and must win over a
+    // refreshed network stream. WebKit can resolve play() without advancing a
+    // network-backed element after a remote Pause -> Play or Next command.
+    const localUrl = getSyncOfflineTrackUrl(this.currentTrack.id) || getPreparedTrackUrl(this.currentTrack.id);
+    this.audio.src = localUrl || this.getStreamUrl(this.currentTrack, true);
     this.resetProgressObservation();
     this.syncStore({ isPlaying: false, isBuffering: true, status: "BUFFERING" });
     this.keepMediaSessionActive();
     this.requestPlay();
     this.scheduleRecovery();
+    if (localUrl) this.scheduleRemoteProgressCheck();
   }
 
   private async resolveCurrentDuration() {
