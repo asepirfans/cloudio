@@ -53,7 +53,7 @@ Konfigurasi server:
 | Variabel | Default | Keterangan |
 | --- | --- | --- |
 | `STREAM_SECRET` | wajib | Pertahankan secret server yang sudah ada; jangan commit nilainya |
-| `PUBLIC_BASE_URL` | `https://diskonsumopod.web.id` | URL publik resolver |
+| `PUBLIC_BASE_URL` | `https://resolver.cloudiolabs.my.id` | URL publik resolver |
 | `PORT` | `8081` | Port saat menjalankan `python main.py` |
 | `RESOLVE_TIMEOUT` | `12` | Batas waktu satu pekerjaan resolve, detik |
 | `STREAM_OPEN_TIMEOUT` | `35` | Batas total pembukaan stream termasuk retry, detik |

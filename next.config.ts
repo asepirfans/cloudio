@@ -38,8 +38,8 @@ const nextConfig: NextConfig = {
     "localhost:3000",
   ],
   env: {
-    RESOLVER_SERVICE_URL: process.env.RESOLVER_SERVICE_URL || "https://diskonsumopod.web.id",
-    NEXT_PUBLIC_RESOLVER_URL: process.env.NEXT_PUBLIC_RESOLVER_URL || "https://diskonsumopod.web.id",
+    RESOLVER_SERVICE_URL: process.env.RESOLVER_SERVICE_URL || "https://resolver.cloudiolabs.my.id",
+    NEXT_PUBLIC_RESOLVER_URL: process.env.NEXT_PUBLIC_RESOLVER_URL || "https://resolver.cloudiolabs.my.id",
   },
   rewrites: async () => [
     {
@@ -47,7 +47,7 @@ const nextConfig: NextConfig = {
       destination:
         process.env.NODE_ENV === "development"
           ? "http://127.0.0.1:8000/api/py/:path*"
-          : "https://diskonsumopod.web.id/api/py/:path*",
+          : "https://resolver.cloudiolabs.my.id/api/py/:path*",
     },
   ],
 };

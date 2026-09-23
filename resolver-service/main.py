@@ -38,7 +38,7 @@ load_dotenv()
 
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL",
-    "https://diskonsumopod.web.id"
+    "https://resolver.cloudiolabs.my.id"
 ).rstrip("/")
 
 STREAM_SECRET = os.getenv("STREAM_SECRET")
@@ -53,7 +53,7 @@ ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
         "ALLOWED_ORIGINS",
-        "https://diskonsumopod.web.id"
+        "https://resolver.cloudiolabs.my.id"
     ).split(",")
     if origin.strip()
 ]

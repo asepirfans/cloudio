@@ -1110,7 +1110,7 @@ export class AudioManager {
     const providerTrackId = parts.length > 1 ? parts.slice(1).join(":") : track.id;
 
     if (provider === "ytm") {
-      const resolverBase = (process.env.NEXT_PUBLIC_RESOLVER_URL || "https://diskonsumopod.web.id").replace(/\/+$/, "");
+      const resolverBase = (process.env.NEXT_PUBLIC_RESOLVER_URL || "https://resolver.cloudiolabs.my.id").replace(/\/+$/, "");
       return `${resolverBase}/stream?id=${encodeURIComponent(providerTrackId)}${forceRefresh ? "&refresh=1" : ""}`;
     }
 

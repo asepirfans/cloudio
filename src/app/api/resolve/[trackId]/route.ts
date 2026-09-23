@@ -36,7 +36,7 @@ async function handleResolve(
   }
 
   try {
-    const resolverBase = (process.env.RESOLVER_SERVICE_URL || "https://diskonsumopod.web.id").replace(/\/+$/, "");
+    const resolverBase = (process.env.RESOLVER_SERVICE_URL || "https://resolver.cloudiolabs.my.id").replace(/\/+$/, "");
 
     if (provider === "ytm" && resolverBase) {
       const res = await fetch(`${resolverBase}/resolve?id=${encodeURIComponent(providerTrackId)}${searchParams.get("refresh") === "1" ? "&refresh=1" : ""}`, {
