@@ -131,6 +131,7 @@ function player(verifiedDuration = null, preparedUrl = () => null) {
     },
     './mediaSession': { setupMediaSession: handlers => { mediaSessionRegistrations++; Object.assign(controls, handlers); }, updateMediaMetadata() {}, setMediaSessionPlaybackState() {}, setMediaSessionPosition() {} },
     './logger': logger,
+    './vault': load('src/audio/vault.ts'),
     '@/services/offline-storage': offline,
   }, {
     window, document, navigator: {}, Audio, Date: Clock, localStorage: { removeItem() {}, setItem() {} },
@@ -392,36 +393,38 @@ test('shuffle preserves the current track while changing preparation order', () 
 });
 
 function warmer(fetch) {
-  return load('src/audio/preload.ts', { './logger': logger, '@/services/offline-storage': offline }, { fetch });
+  return load('src/audio/preload.ts', { './logger': logger, './vault': load('src/audio/vault.ts'), '@/services/offline-storage': offline }, { fetch });
 }
 const resolved = () => Response.json({ status: 'warmed', url: 'https://resolver.test/stream' });
-const preparedAudio = range => range === 'bytes=0-0'
-  ? new Response('a', { status: 206, headers: { 'Content-Type': 'audio/mp4', 'Content-Range': 'bytes 0-0/4' } })
-  : new Response('abcd', { status: 206, headers: { 'Content-Type': 'audio/mp4', 'Content-Range': 'bytes 0-3/4' } });
+const preparedAudio = (headers = {}) => new Response('prefix-bytes', {
+  status: 206,
+  headers: { 'Content-Type': 'audio/mp4', 'Content-Range': 'bytes 0-65535/1000000', ...headers },
+});
 
 test('prewarm resolves and retains one complete local audio URL', async () => {
   const calls = [];
   const preload = warmer(async (url, options) => {
     calls.push({ url, options });
-    return calls.length === 1 ? resolved() : preparedAudio(options.headers.Range);
+    return calls.length === 1 ? resolved() : preparedAudio();
   });
   preload.retainPreparedTracks(['ytm:b']);
   const first = preload.prewarmNextTrack(track('b'));
   assert.equal(preload.prewarmNextTrack(track('b')), first);
   assert.equal(await first, true);
   assert.equal(await preload.prewarmNextTrack(track('b')), true);
-  assert.equal(calls.length, 3);
-  assert.equal(calls[1].options.headers.Range, 'bytes=0-0');
-  assert.equal(calls[2].options.headers.Range, 'bytes=0-3');
-  assert.ok(preload.getPreparedTrackUrl('ytm:b').startsWith('blob:'));
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].url, '/api/resolve/ytm%3Ab');
+  assert.equal(calls[1].url, 'https://resolver.test/stream');
+  assert.equal(calls[1].options.headers.Range, 'bytes=0-65535');
+  assert.equal(preload.getPreparedTrackUrl('ytm:b'), 'https://resolver.test/stream');
 });
 
 test('dropping a prepared track revokes its local URL', async () => {
   let count = 0;
-  const preload = warmer(async (url, options) => ++count === 1 ? resolved() : preparedAudio(options.headers.Range));
+  const preload = warmer(async (url, options) => ++count === 1 ? resolved() : preparedAudio());
   preload.retainPreparedTracks(['ytm:b']);
   assert.equal(await preload.prewarmNextTrack(track('b')), true);
-  assert.ok(preload.getPreparedTrackUrl('ytm:b'));
+  assert.equal(preload.getPreparedTrackUrl('ytm:b'), 'https://resolver.test/stream');
   preload.retainPreparedTracks(['ytm:c']);
   assert.equal(preload.getPreparedTrackUrl('ytm:b'), null);
 });
@@ -474,6 +477,7 @@ test('second upcoming track resolves metadata without fetching audio', async () 
   assert.equal(await preload.prewarmTrackMetadata(track('c')), true);
   assert.equal(calls.length, 1);
   assert.ok(calls[0].url.includes('/api/resolve/'));
+  assert.equal(preload.getPreparedTrackUrl('ytm:c'), 'https://resolver.test/stream');
 });
 
 test('diagnostics persist in production, redact URLs, and cap history', () => {
@@ -517,15 +521,26 @@ test('foreground while resolver is still loading does not spend a retry or repla
   p.manager.pause();
 });
 
-test('overlarge prepared responses are cancelled before reading their bodies', async () => {
+test('prefix probe cancels stream body after verifying headers', async () => {
   let cancelled = false;
   let count = 0;
   const preload = warmer(async () => ++count === 1 ? resolved() : new Response(new ReadableStream({ cancel() { cancelled = true; } }), {
-    status: 206, headers: { 'content-type': 'audio/mp4', 'content-range': `bytes 0-0/${25 * 1024 * 1024}` },
+    status: 206, headers: { 'content-type': 'audio/mp4', 'content-range': 'bytes 0-65535/10000000' },
   }));
   preload.retainPreparedTracks(['ytm:b']);
-  assert.equal(await preload.prewarmNextTrack(track('b')), false);
+  assert.equal(await preload.prewarmNextTrack(track('b')), true);
   assert.equal(cancelled, true);
+});
+
+test('retainPreparedTracks evicts expired signed URLs', async () => {
+  let count = 0;
+  const preload = warmer(async () => ++count === 1
+    ? Response.json({ status: 'warmed', url: 'https://resolver.test/stream', expiresAt: Math.floor(Date.now() / 1000) - 10 })
+    : preparedAudio()
+  );
+  preload.retainPreparedTracks(['ytm:b']);
+  assert.equal(await preload.prewarmNextTrack(track('b')), true);
+  assert.equal(preload.getPreparedTrackUrl('ytm:b'), null);
 });
 
 test('reported iPhone case: verified 202s song at 236s advances without ended', () => {

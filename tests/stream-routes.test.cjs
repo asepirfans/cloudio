@@ -14,27 +14,56 @@ function route(name, fetch) {
     exports: module.exports, module, fetch, Response, Headers, AbortSignal, AbortController, setTimeout, clearTimeout,
     process: { env: { RESOLVER_SERVICE_URL: 'https://resolver.test' } },
     console: { warn() {}, error() {} },
-    require: id => id === 'next/server' ? { NextResponse: { json: (body, init) => Response.json(body, init) } } : { audiusProvider: {} },
+    require: id => {
+      if (id === 'next/server') {
+        return {
+          NextResponse: {
+            json: (body, init) => Response.json(body, init),
+            redirect: (url, init) => new Response(null, {
+              status: typeof init === 'number' ? init : (init?.status || 307),
+              headers: new Headers({ Location: url, ...(init?.headers || {}) }),
+            }),
+          },
+        };
+      }
+      if (id === '@/audio/vault') {
+        return { maskStreamUrl: x => `vlt_${x}`, unmaskStreamUrl: x => x.slice(4) };
+      }
+      return { audiusProvider: {} };
+    },
   });
   return module.exports;
 }
 const request = query => ({ nextUrl: new URL(`https://app.test/api/stream/ytm:abcdefghijk?${query}`), headers: new Headers({ Range: 'bytes=0-3' }), signal: new AbortController().signal });
 const params = { params: Promise.resolve({ trackId: 'ytm:abcdefghijk' }) };
 
-test('stream forwards refresh and range; preserves resolver cache policy', async () => {
+test('stream redirects to resolver by default without proxying audio bytes', async () => {
+  let fetched = false;
+  const api = route('stream', async () => {
+    fetched = true;
+    return new Response('audio');
+  });
+  const result = await api.GET(request('audio=true&refresh=1'), params);
+  assert.equal(result.status, 307);
+  assert.equal(result.headers.get('Location'), 'https://resolver.test/stream?id=abcdefghijk&refresh=1');
+  assert.equal(result.headers.get('Cache-Control'), 'private, no-store');
+  assert.equal(fetched, false);
+});
+
+test('stream forwards refresh and range when proxy=1 is explicitly set', async () => {
   const api = route('stream', async (url, options) => {
     assert.equal(new URL(url).searchParams.get('refresh'), '1');
     assert.equal(options.headers.Range, 'bytes=0-3');
     assert.equal(options.cache, 'no-store');
     return new Response('abcd', { status: 206, headers: { 'Content-Range': 'bytes 0-3/100', 'Cache-Control': 'private, no-store' } });
   });
-  const result = await api.GET(request('audio=true&refresh=1'), params);
+  const result = await api.GET(request('audio=true&refresh=1&proxy=1'), params);
   assert.equal(result.status, 206);
   assert.equal(result.headers.get('content-range'), 'bytes 0-3/100');
   assert.equal(result.headers.get('cache-control'), 'private, no-store');
 });
 
-test('failed audio response is closed before a real refresh retry', async () => {
+test('failed audio response is closed before a real refresh retry when proxying', async () => {
   let calls = 0;
   let cancelled = false;
   const api = route('stream', async url => {
@@ -43,16 +72,16 @@ test('failed audio response is closed before a real refresh retry', async () => 
     assert.equal(new URL(url).searchParams.get('refresh'), '1');
     return new Response('audio');
   });
-  const result = await api.GET(request('audio=true'), params);
+  const result = await api.GET(request('audio=true&proxy=1'), params);
   assert.equal(await result.text(), 'audio');
   assert.equal(calls, 2);
 });
 
-test('416 and rate limits do not trigger unnecessary resolver retries', async () => {
+test('416 and rate limits do not trigger unnecessary resolver retries when proxying', async () => {
   for (const status of [416, 429, 503, 504]) {
     let calls = 0;
     const api = route('stream', async () => { calls++; return new Response('', { status, headers: { 'Retry-After': '2' } }); });
-    const result = await api.GET(request('audio=true'), params);
+    const result = await api.GET(request('audio=true&proxy=1'), params);
     assert.equal(result.status, status);
     assert.equal(result.headers.get('retry-after'), '2');
     assert.equal(calls, 1);
@@ -73,4 +102,12 @@ test('resolve forwards refresh and exposes signed URL expiration', async () => {
   });
   const result = await api.GET(request('refresh=1'), params);
   assert.equal((await result.json()).expiresAt, 12345);
+});
+
+test('metadata response returns direct stream URL', async () => {
+  const api = route('stream', async () => Response.json({ status: 'warmed', url: 'https://resolver.test/stream?id=abcdefghijk&exp=123', duration: 180 }));
+  const result = await api.GET(request(''), params);
+  const data = await result.json();
+  assert.equal(data.source.url, 'https://resolver.test/stream?id=abcdefghijk&exp=123');
+  assert.equal(data.source.duration, 180);
 });

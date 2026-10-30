@@ -1,6 +1,7 @@
 import type { Track } from "@/types/music";
 import { isTrackOffline } from "@/services/offline-storage";
 import { audioLogger } from "./logger";
+import { unmaskStreamUrl } from "./vault";
 
 const resolvedDurations = new Map<string, { duration: number; at: number }>();
 
@@ -18,11 +19,9 @@ export function getResolvedDuration(id: string): number | null {
 
 const WARM_TTL_MS = 5 * 60 * 1000;
 const FAILURE_COOLDOWN_MS = 15000;
-const MAX_PREPARED_BYTES = 24 * 1024 * 1024;
-const PREPARED_CHUNK_BYTES = 1024 * 1024;
 const retainedIds = new Set<string>();
 const warmed = new Map<string, number>();
-const preparedUrls = new Map<string, { url: string; at: number }>();
+const preparedUrls = new Map<string, { url: string; at: number; expiresAt: number }>();
 const failed = new Map<string, number>();
 type PendingPreparation = {
   controller: AbortController;
@@ -37,9 +36,9 @@ export function retainPreparedTracks(ids: string[]) {
   for (const [id, preparation] of pending) {
     if (!retainedIds.has(id)) preparation.controller.abort();
   }
+  const now = Date.now();
   for (const [id, prepared] of preparedUrls) {
-    if (!retainedIds.has(id)) {
-      URL.revokeObjectURL(prepared.url);
+    if (!retainedIds.has(id) || now >= prepared.expiresAt || now - prepared.at >= WARM_TTL_MS) {
       preparedUrls.delete(id);
     }
   }
@@ -49,8 +48,7 @@ export function retainPreparedTracks(ids: string[]) {
 
 export function getPreparedTrackUrl(id: string): string | null {
   const prepared = preparedUrls.get(id);
-  if (!prepared || Date.now() - prepared.at >= WARM_TTL_MS) {
-    if (prepared) URL.revokeObjectURL(prepared.url);
+  if (!prepared || Date.now() >= prepared.expiresAt || Date.now() - prepared.at >= WARM_TTL_MS) {
     preparedUrls.delete(id);
     return null;
   }
@@ -96,55 +94,56 @@ async function prepare(track: Track, preparation: PendingPreparation): Promise<b
     });
     if (!resolved.ok) throw new Error(`Resolve HTTP ${resolved.status}`);
     const data = await resolved.json();
-    if (data.status !== "warmed") throw new Error("Resolver did not confirm warm state");
+    if (data.status !== "warmed") {
+      throw new Error("Resolver did not confirm warm state");
+    }
+    const resolvedUrl = data.ticket ? unmaskStreamUrl(data.ticket) : data.url;
+    if (typeof resolvedUrl !== "string" || !resolvedUrl) {
+      throw new Error("Resolver did not confirm warm state");
+    }
+    const expiresAt = typeof data.expiresAt === "number" ? data.expiresAt * 1000 - 30000 : Date.now() + WARM_TTL_MS;
     rememberResolvedDuration(track.id, data.duration);
     if (controller.signal.aborted || !retainedIds.has(track.id)) return false;
+
+    preparedUrls.set(track.id, { url: resolvedUrl, at: Date.now(), expiresAt });
     if (!preparation.wantPrefix) {
       failed.delete(track.id);
       audioLogger.log("prewarm.resolved", { trackId: track.id });
       return true;
     }
 
-    // Full responses from YouTube are content-paced and can take the duration of
-    // the song to finish. Same-origin range chunks bypass that pacing, as used by
-    // the proven offline downloader, while keeping this buffer memory-only.
-    const url = `/api/stream/${encodeURIComponent(track.id)}?audio=true`;
-    const probe = await fetch(url, {
-      headers: { Range: "bytes=0-0" }, signal: controller.signal, cache: "no-store",
-    });
-    const range = /^bytes 0-0\/(\d+)$/.exec(probe.headers.get("content-range") || "");
-    const totalBytes = range ? Number(range[1]) : 0;
-    const type = probe.headers.get("content-type") || "";
-    await probe.body?.cancel();
-    if (probe.status !== 206 || !totalBytes || totalBytes > MAX_PREPARED_BYTES || !/^(audio\/|video\/mp4|application\/octet-stream)/.test(type)) {
-      throw new Error("Invalid or oversized prepared audio probe");
-    }
-    const chunks: ArrayBuffer[] = [];
-    let received = 0;
-    for (let start = 0; start < totalBytes; start += PREPARED_CHUNK_BYTES) {
-      const end = Math.min(start + PREPARED_CHUNK_BYTES - 1, totalBytes - 1);
-      const response = await fetch(url, {
-        headers: { Range: `bytes=${start}-${end}` }, signal: controller.signal, cache: "no-store",
+    const probeUrl = data.ticket ? `/stream-vault/media/${data.ticket}.m4a` : resolvedUrl;
+    const isYtm = track.provider === "ytm" || resolvedUrl.includes("/stream");
+    if (isYtm) {
+      const probe = await fetch(probeUrl, {
+        headers: { Range: "bytes=0-65535" },
+        signal: controller.signal,
+        cache: "no-store",
       });
-      const chunkRange = response.headers.get("content-range") || "";
-      if (response.status !== 206 || chunkRange !== `bytes ${start}-${end}/${totalBytes}`) {
-        await response.body?.cancel();
-        throw new Error(`Invalid prepared audio range ${start}-${end}`);
+      const type = probe.headers.get("content-type") || "";
+      await probe.body?.cancel();
+      if (probe.status !== 206 || !/^(audio\/|video\/mp4|application\/octet-stream)/.test(type)) {
+        preparedUrls.delete(track.id);
+        failed.set(track.id, Date.now());
+        throw new Error("Invalid prepared audio prefix probe");
       }
-      const chunk = await response.arrayBuffer();
-      if (chunk.byteLength !== end - start + 1) throw new Error("Truncated prepared audio chunk");
-      chunks.push(chunk);
-      received += chunk.byteLength;
+    } else {
+      try {
+        const probe = await fetch(data.url, {
+          headers: { Range: "bytes=0-65535" },
+          signal: controller.signal,
+          cache: "no-store",
+        });
+        await probe.body?.cancel();
+      } catch {
+        // Non-fatal for third-party providers with strict CORS Range policies
+      }
     }
-    if (received !== totalBytes) throw new Error("Truncated prepared audio");
+
     if (controller.signal.aborted || !retainedIds.has(track.id)) return false;
-    const previous = preparedUrls.get(track.id);
-    if (previous) URL.revokeObjectURL(previous.url);
-    const preparedUrl = URL.createObjectURL(new Blob(chunks, { type }));
-    preparedUrls.set(track.id, { url: preparedUrl, at: Date.now() });
     warmed.set(track.id, Date.now());
     failed.delete(track.id);
-    audioLogger.log("prewarm.ready", { trackId: track.id, bytes: received });
+    audioLogger.log("prewarm.ready", { trackId: track.id });
     return true;
   } catch (error) {
     if (!controller.signal.aborted && retainedIds.has(track.id)) {
@@ -163,4 +162,41 @@ function prune(entries: Map<string, number>, ttl: number) {
   const now = Date.now();
   for (const [id, at] of entries) if (now - at >= ttl) entries.delete(id);
   while (entries.size > 32) entries.delete(entries.keys().next().value!);
+}
+
+export async function getDirectStreamUrl(
+  track: Pick<Track, "id"> & Partial<Pick<Track, "provider" | "providerTrackId">> | string,
+  forceRefresh = false
+): Promise<string> {
+  const trackId = typeof track === "string" ? track : track.id;
+  const parts = trackId.split(":");
+  const provider = parts.length > 1 ? parts[0] : (typeof track === "object" && track.provider ? track.provider : "ytm");
+  const providerTrackId = parts.length > 1 ? parts.slice(1).join(":") : (typeof track === "object" && track.providerTrackId ? track.providerTrackId : trackId);
+
+  if (!forceRefresh) {
+    const preparedUrl = getPreparedTrackUrl(trackId);
+    if (preparedUrl) return preparedUrl;
+  }
+
+  const resolverBase = (process.env.NEXT_PUBLIC_RESOLVER_URL || "https://resolver.cloudiolabs.my.id").replace(/\/+$/, "");
+
+  try {
+    const res = await fetch(`/api/resolve/${encodeURIComponent(trackId)}${forceRefresh ? "?refresh=1" : ""}`, {
+      cache: "no-store",
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const resolvedUrl = data?.ticket ? unmaskStreamUrl(data.ticket) : data?.url;
+      if (resolvedUrl) {
+        const expiresAt = typeof data.expiresAt === "number" ? data.expiresAt * 1000 - 30000 : Date.now() + WARM_TTL_MS;
+        preparedUrls.set(trackId, { url: resolvedUrl, at: Date.now(), expiresAt });
+        return resolvedUrl;
+      }
+    }
+  } catch {}
+
+  if (provider === "ytm") {
+    return `${resolverBase}/stream?id=${encodeURIComponent(providerTrackId)}${forceRefresh ? "&refresh=1" : ""}`;
+  }
+  return `/api/stream/${encodeURIComponent(trackId)}?audio=true${forceRefresh ? "&refresh=1" : ""}`;
 }

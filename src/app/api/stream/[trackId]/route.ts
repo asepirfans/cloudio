@@ -79,6 +79,20 @@ export async function GET(
   try {
     // 1. Direct audio streaming proxy (handles HTTP Range requests with status 206 Partial Content)
     if (searchParams.get("audio") === "true" || searchParams.get("play") === "true") {
+      const resolverBase = (process.env.RESOLVER_SERVICE_URL || "https://resolver.cloudiolabs.my.id").replace(/\/+$/, "");
+      const isProxy = searchParams.get("proxy") === "1";
+
+      if (provider === "ytm" && resolverBase && !isProxy) {
+        const redirectUrl = `${resolverBase}/stream?id=${encodeURIComponent(providerTrackId)}${forceRefresh ? "&refresh=1" : ""}`;
+        return NextResponse.redirect(redirectUrl, {
+          status: 307,
+          headers: {
+            "Cache-Control": "private, no-store",
+            "Access-Control-Allow-Origin": "*",
+          },
+        });
+      }
+
       const range = req.headers.get("range");
       const forwardHeaders: Record<string, string> = {
         "User-Agent":
@@ -91,8 +105,6 @@ export async function GET(
 
       let streamFetchUrl: string | null = null;
 
-
-      const resolverBase = (process.env.RESOLVER_SERVICE_URL || "https://resolver.cloudiolabs.my.id").replace(/\/+$/, "");
       if (provider === "ytm" && resolverBase) {
         streamFetchUrl = `${resolverBase}/stream?id=${encodeURIComponent(providerTrackId)}${forceRefresh ? "&refresh=1" : ""}`;
       } else {
@@ -184,7 +196,7 @@ export async function GET(
 
     return NextResponse.json({
       source: {
-        url: `/api/stream/${encodeURIComponent(decoded)}?audio=true`,
+        url: streamUrl,
         type: "direct",
         provider,
         duration: trackDuration,

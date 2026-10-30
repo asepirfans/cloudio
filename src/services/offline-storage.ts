@@ -1,6 +1,7 @@
 "use client";
 
 import type { Track } from "@/types/music";
+import { getDirectStreamUrl } from "@/audio/preload";
 
 export interface OfflineTrackRecord {
   id: string;
@@ -156,7 +157,7 @@ export async function saveTrackOffline(
 ): Promise<void> {
   if (typeof window === "undefined") return;
 
-  const streamUrl = `/api/stream/${encodeURIComponent(track.id)}?audio=true`;
+  const streamUrl = await getDirectStreamUrl(track);
   let blob: Blob;
 
   try {

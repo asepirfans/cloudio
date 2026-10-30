@@ -1,5 +1,10 @@
 import type { NextConfig } from "next";
+import os from "os";
 
+const localIps = Object.values(os.networkInterfaces())
+  .flat()
+  .filter((iface): iface is os.NetworkInterfaceInfo => Boolean(iface && !iface.internal && iface.family === "IPv4"))
+  .map((iface) => iface.address);
 const nextConfig: NextConfig = {
   images: {
     remotePatterns: [
@@ -30,12 +35,11 @@ const nextConfig: NextConfig = {
   ],
   // Allow mobile and local network access in development
   allowedDevOrigins: [
-    "192.168.100.242",
-    "192.168.100.242:3000",
-    "192.168.100.227",
-    "192.168.100.227:3000",
-    "192.168.15.157",
     "localhost:3000",
+    ...localIps,
+    ...localIps.map((ip) => `${ip}:3000`),
+    "192.168.100.12",
+    "192.168.100.12:3000",
   ],
   env: {
     RESOLVER_SERVICE_URL: process.env.RESOLVER_SERVICE_URL || "https://resolver.cloudiolabs.my.id",

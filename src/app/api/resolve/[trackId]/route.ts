@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { audiusProvider } from "@/music/audius/provider";
-
+import { maskStreamUrl } from "@/audio/vault";
 export const runtime = "nodejs";
 
 export async function POST(
@@ -45,10 +45,11 @@ async function handleResolve(
       });
       if (res.ok) {
         const data = await res.json();
+        const ticket = maskStreamUrl(data.url);
         return NextResponse.json({
           status: "warmed",
           trackId: decoded,
-          url: data.url,
+          ticket,
           duration: data.duration,
           expiresAt: data.expiresAt,
         });
@@ -57,10 +58,11 @@ async function handleResolve(
     } else if (provider === "audius") {
       const source = await audiusProvider.getStream(providerTrackId);
       if (source?.url) {
+        const ticket = maskStreamUrl(source.url);
         return NextResponse.json({
           status: "warmed",
           trackId: decoded,
-          url: source.url,
+          ticket,
         });
       }
     }

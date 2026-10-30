@@ -1,4 +1,25 @@
-const CACHE_NAME = "cloudio-v7";
+const CACHE_NAME = "cloudio-v9";
+
+const VAULT_SALT = 0x5a;
+
+function unmaskStreamUrl(token) {
+  if (!token) return null;
+  const raw = token.startsWith("vlt_") ? token.slice(4) : token;
+  try {
+    const pad = raw.length % 4;
+    const base64 = (raw + (pad ? "=".repeat(4 - pad) : "")).replace(/-/g, "+").replace(/_/g, "/");
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i) ^ (VAULT_SALT + (i % 37));
+    }
+    const url = new TextDecoder().decode(bytes);
+    if (url.startsWith("http://") || url.startsWith("https://")) {
+      return url;
+    }
+  } catch {}
+  return null;
+}
 
 const PRECACHE_ASSETS = [
   "/",
@@ -50,6 +71,27 @@ self.addEventListener("fetch", (event) => {
   // Skip cross-origin requests
   if (url.origin !== self.location.origin) {
     return;
+  }
+
+  // Virtual stream interceptor: proxies masked stream requests directly to upstream resolver
+  if (url.pathname.startsWith("/stream-vault/")) {
+    let vault = url.searchParams.get("vault");
+    if (!vault && url.pathname.startsWith("/stream-vault/media/")) {
+      vault = url.pathname.slice("/stream-vault/media/".length).replace(/\.m4a$/, "");
+    }
+    const targetUrl = vault ? unmaskStreamUrl(vault) : null;
+    if (targetUrl) {
+      const headers = new Headers();
+      const range = request.headers.get("Range");
+      if (range) headers.set("Range", range);
+      event.respondWith(
+        fetch(targetUrl, {
+          headers,
+          cache: "no-store",
+        })
+      );
+      return;
+    }
   }
 
   // Do not cache API routes or stream endpoints (handled via IndexedDB)

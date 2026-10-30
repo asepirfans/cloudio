@@ -26,6 +26,7 @@ import { useOfflineStorage } from "@/hooks/useOfflineStorage";
 import { getOfflineTrackBlob } from "@/services/offline-storage";
 import { usePlaylistStore, type Playlist } from "@/stores/playlist-store";
 import type { Track } from "@/types/music";
+import { getDirectStreamUrl } from "@/audio/preload";
 
 interface TrackActionsModalProps {
   track: Track | null;
@@ -122,7 +123,7 @@ export function TrackActionsModal({ track, isOpen, onClose }: TrackActionsModalP
     try {
       let blob = await getOfflineTrackBlob(track.id);
       if (!blob) {
-        const downloadUrl = `/api/stream/${encodeURIComponent(track.id)}?audio=true`;
+        const downloadUrl = await getDirectStreamUrl(track);
         const res = await fetch(downloadUrl, { headers: { Range: "bytes=0-" } });
         blob = await res.blob();
       }

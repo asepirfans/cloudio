@@ -9,6 +9,7 @@ import {
 } from "./mediaSession";
 import { audioLogger } from "./logger";
 import { getSyncOfflineTrackUrl } from "@/services/offline-storage";
+import { maskStreamUrl } from "./vault";
 
 // Python allows 35s to open a stream. Give it time to return before retrying.
 const STREAM_WAIT_MS = 40000;
@@ -17,6 +18,11 @@ const REMOTE_PROGRESS_WAIT_MS = 5000;
 const REMOTE_NAVIGATION_COOLDOWN_MS = 450;
 const MAX_FAILED_TRACKS = 3;
 const RESUME_STORAGE_KEY = "cloudbeats_playback_resume";
+declare global {
+  interface Window {
+    __cloudbeats_audio__?: HTMLAudioElement;
+  }
+}
 
 export interface AudioManagerStoreSync {
   setState: (state: Partial<any>) => void;
@@ -79,15 +85,25 @@ export class AudioManager {
     if (typeof window === "undefined") return;
     if (this.audio) return;
 
-    if ((window as any).__cloudbeats_audio__) {
-      this.audio = (window as any).__cloudbeats_audio__;
+    if (window.__cloudbeats_audio__) {
+      this.audio = window.__cloudbeats_audio__;
     } else {
-      this.audio = new Audio();
-      this.audio.preload = "auto";
-      this.audio.setAttribute("playsinline", "true");
-      this.audio.setAttribute("webkit-playsinline", "true");
-      this.audio.setAttribute("x-webkit-airplay", "allow");
-      (window as any).__cloudbeats_audio__ = this.audio;
+      // iOS WebKit forces AVAudioSessionCategoryPlayback on <video playsinline>,
+      // which bypasses the hardware Silent Switch even on insecure LAN origins (http://).
+      // HTMLAudioElement defaults to Ambient on non-HTTPS origins, muting during Silent mode.
+      if (typeof document !== "undefined" && typeof document.createElement === "function") {
+        const el = document.createElement("video");
+        el.preload = "auto";
+        el.setAttribute("playsinline", "true");
+        el.setAttribute("webkit-playsinline", "true");
+        el.setAttribute("x-webkit-airplay", "allow");
+        el.style.display = "none";
+        el.setAttribute("aria-hidden", "true");
+        this.audio = el as unknown as HTMLAudioElement;
+      } else {
+        this.audio = new Audio();
+      }
+      window.__cloudbeats_audio__ = this.audio;
     }
 
     // Safari supports an explicit playback category for background media.
@@ -207,8 +223,8 @@ export class AudioManager {
         this.prepareNextTrack();
       }
 
-      // Preload next track 10-15s before current track finishes so lock-screen switch is instantaneous
-      if (this.shouldBePlaying && effectiveDuration > 0 && effectiveDuration - curTime <= 15 && !this.hasPreloadedNearEnd) {
+      // Preload next track 15-20s before current track finishes so lock-screen switch is instantaneous
+      if (this.shouldBePlaying && effectiveDuration > 0 && effectiveDuration - curTime <= 20 && !this.hasPreloadedNearEnd) {
         this.hasPreloadedNearEnd = true;
         this.prepareNextTrack();
       }
@@ -315,8 +331,18 @@ export class AudioManager {
     });
   }
 
+  private ensureAudioSessionPlayback() {
+    try {
+      const session = (navigator as Navigator & { audioSession?: { type: string } }).audioSession;
+      if (session && session.type !== "playback") {
+        session.type = "playback";
+      }
+    } catch {}
+  }
+
   private bindUserGestureUnlock() {
     const unlock = () => {
+      this.ensureAudioSessionPlayback();
       if (this.shouldBePlaying && this.audio.paused && this.currentTrack) {
         this.requestPlay();
       }
@@ -370,7 +396,6 @@ export class AudioManager {
     this.trace(direction === "next" ? "remote.next" : "remote.previous");
     if (direction === "next") this.next();
     else this.previous();
-    this.scheduleRemoteProgressCheck();
   }
 
   // ─── Playback Controls ───────────────────────────────────────────────────
@@ -584,6 +609,11 @@ export class AudioManager {
   // Every play attempt is scoped to both the selected track and latest command.
   private requestPlay() {
     if (!this.shouldBePlaying || !this.currentTrack) return;
+    this.ensureAudioSessionPlayback();
+    if (this.audio.muted) {
+      this.audio.muted = false;
+      this.syncStore({ isMuted: false });
+    }
     const generation = this.playbackGeneration;
     const request = ++this.playRequest;
     this.trace("play.request");
@@ -847,6 +877,7 @@ export class AudioManager {
       this.remoteProgressTimer = null;
       if (generation !== this.playbackGeneration || !this.shouldBePlaying) return;
       if (!this.audio.paused && this.audio.currentTime > position + 0.05) return;
+      if (!this.hasStartedCurrentTrack && position === 0) return;
       this.trace("remote.progress-stuck", { position });
       this.recoverPlayback();
     }, REMOTE_PROGRESS_WAIT_MS);
@@ -898,17 +929,16 @@ export class AudioManager {
     this.pendingSeekTime = Number.isFinite(position) && position > 0 ? position : null;
     this.hasStartedCurrentTrack = false;
     this.clearEndTimer();
-    // A prepared/offline URL remains usable while locked and must win over a
-    // refreshed network stream. WebKit can resolve play() without advancing a
-    // network-backed element after a remote Pause -> Play or Next command.
-    const localUrl = getSyncOfflineTrackUrl(this.currentTrack.id) || getPreparedTrackUrl(this.currentTrack.id);
-    this.audio.src = localUrl || this.getStreamUrl(this.currentTrack, true);
+    const offlineUrl = getSyncOfflineTrackUrl(this.currentTrack.id);
+    const preparedUrl = !this.audio.error && this.recoveryAttempts === 1 ? getPreparedTrackUrl(this.currentTrack.id) : null;
+    const targetUrl = offlineUrl || preparedUrl || this.getStreamUrl(this.currentTrack, true);
+    this.audio.src = targetUrl;
     this.resetProgressObservation();
     this.syncStore({ isPlaying: false, isBuffering: true, status: "BUFFERING" });
     this.keepMediaSessionActive();
     this.requestPlay();
     this.scheduleRecovery();
-    if (localUrl) this.scheduleRemoteProgressCheck();
+    if (offlineUrl || preparedUrl) this.scheduleRemoteProgressCheck();
   }
 
   private async resolveCurrentDuration() {
@@ -1101,20 +1131,27 @@ export class AudioManager {
       return offlineUrl;
     }
     const preparedUrl = forceRefresh ? null : getPreparedTrackUrl(track.id);
-    if (preparedUrl) {
-      return preparedUrl;
-    }
 
     const parts = track.id.split(":");
     const provider = parts.length > 1 ? parts[0] : (track.provider || "ytm");
     const providerTrackId = parts.length > 1 ? parts.slice(1).join(":") : track.id;
 
-    if (provider === "ytm") {
+    let targetUrl: string;
+    if (preparedUrl) {
+      targetUrl = preparedUrl;
+    } else if (provider === "ytm") {
       const resolverBase = (process.env.NEXT_PUBLIC_RESOLVER_URL || "https://resolver.cloudiolabs.my.id").replace(/\/+$/, "");
-      return `${resolverBase}/stream?id=${encodeURIComponent(providerTrackId)}${forceRefresh ? "&refresh=1" : ""}`;
+      targetUrl = `${resolverBase}/stream?id=${encodeURIComponent(providerTrackId)}${forceRefresh ? "&refresh=1" : ""}`;
+    } else {
+      targetUrl = `/api/stream/${encodeURIComponent(track.id)}?audio=true${forceRefresh ? "&refresh=1" : ""}`;
     }
 
-    return `/api/stream/${encodeURIComponent(track.id)}?audio=true${forceRefresh ? "&refresh=1" : ""}`;
+    if (targetUrl.startsWith("http://") || targetUrl.startsWith("https://")) {
+      const ticket = maskStreamUrl(targetUrl);
+      return `/stream-vault/stream?id=${encodeURIComponent(providerTrackId)}${forceRefresh ? "&refresh=1" : ""}&vault=${ticket}`;
+    }
+
+    return targetUrl;
   }
 }
 

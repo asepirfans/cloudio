@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import json
 import hmac
 import base64
 import hashlib
@@ -58,10 +59,21 @@ ALLOWED_ORIGINS = [
     if origin.strip()
 ]
 
-STREAM_TOKEN_TTL = int(os.getenv("STREAM_TOKEN_TTL", "600"))   # 10 menit
-STREAM_CACHE_TTL = int(os.getenv("STREAM_CACHE_TTL", "1800"))  # 30 menit
+STREAM_TOKEN_TTL = int(os.getenv("STREAM_TOKEN_TTL", "3600"))  # 1 jam
+STREAM_CACHE_TTL = int(os.getenv("STREAM_CACHE_TTL", "3600"))  # 1 jam
 FORCE_IPV4 = os.getenv("FORCE_IPV4", "true").lower() == "true"
-
+logger = logging.getLogger("cloudio.resolver")
+REDIS_URL = os.getenv("REDIS_URL", "").strip() or None
+redis_client = None
+if REDIS_URL:
+    try:
+        import redis
+        redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=1.5, socket_timeout=1.5)
+        redis_client.ping()
+        logger.info("Connected to Redis cache at %s", REDIS_URL)
+    except Exception as exc:
+        logger.warning("Failed to connect to Redis (%s), fallback to in-memory: %s", REDIS_URL, exc)
+        redis_client = None
 RESOLVE_TIMEOUT = float(os.getenv("RESOLVE_TIMEOUT", "20"))
 STREAM_OPEN_TIMEOUT = float(os.getenv("STREAM_OPEN_TIMEOUT", "35"))
 UPSTREAM_READ_TIMEOUT = os.getenv("UPSTREAM_READ_TIMEOUT")
@@ -69,7 +81,6 @@ RESOLVE_WORKERS = max(8, int(os.getenv("RESOLVE_WORKERS", "24")))
 resolver_executor = ThreadPoolExecutor(max_workers=RESOLVE_WORKERS, thread_name_prefix="resolve")
 resolver_slots = threading.BoundedSemaphore(RESOLVE_WORKERS)
 inflight: dict[str, asyncio.Task] = {}
-logger = logging.getLogger("cloudio.resolver")
 
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -198,6 +209,26 @@ def is_not_available_error(exc: Exception) -> bool:
 
 
 def get_cached_stream(video_id: str):
+    if redis_client:
+        try:
+            err_raw = redis_client.get(f"ytm:err:{video_id}")
+            if err_raw:
+                try:
+                    err = json.loads(err_raw)
+                    raise HTTPException(status_code=err["status"], detail=err["detail"])
+                except (json.JSONDecodeError, KeyError):
+                    pass
+            raw = redis_client.get(f"ytm:{video_id}")
+            if raw:
+                try:
+                    return json.loads(raw)
+                except json.JSONDecodeError:
+                    pass
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
     with cache_lock:
         cached = cache.get(video_id)
         if cached:
@@ -214,24 +245,40 @@ def get_cached_stream(video_id: str):
 def set_cached_stream(video_id: str, data: dict):
     now = time.time()
     expires_at = now + STREAM_CACHE_TTL
+    ttl = STREAM_CACHE_TTL
     try:
         upstream_expiry = float(parse_qs(urlsplit(data["url"]).query)["expire"][0])
         expires_at = min(expires_at, upstream_expiry - 60)
+        ttl = max(60, int(expires_at - now))
     except (KeyError, ValueError, IndexError):
         pass
+
+    if redis_client:
+        try:
+            redis_client.setex(f"ytm:{video_id}", ttl, json.dumps(data))
+            redis_client.delete(f"ytm:err:{video_id}")
+        except Exception:
+            pass
+
     with cache_lock:
         cache[video_id] = {"data": data, "expires_at": expires_at}
         error_cache.pop(video_id, None)
 
 
 def set_error_cache(video_id: str, status: int, detail: str):
+    if redis_client:
+        try:
+            payload = json.dumps({"status": status, "detail": detail})
+            redis_client.setex(f"ytm:err:{video_id}", int(NEGATIVE_CACHE_TTL), payload)
+        except Exception:
+            pass
+
     with cache_lock:
         error_cache[video_id] = {
             "status": status,
             "detail": detail,
             "cached_at": time.time(),
         }
-
 
 # =========================================================
 # VIDEO ID VALIDATION
@@ -373,7 +420,7 @@ async def resolve_uncached(video_id: str) -> dict:
     errors = []
     try:
         async with async_timeout_scope(RESOLVE_TIMEOUT):
-            clients = ["VISION_OS", "ANDROID_VR"]
+            clients = ["VISION_OS", "ANDROID_VR", "IOS_MUSIC", "MWEB"]
             for client in clients:
                 pending.add(submit_client(f"https://www.youtube.com/watch?v={video_id}", client))
             while pending:
@@ -406,6 +453,11 @@ async def resolve_uncached(video_id: str) -> dict:
 
 async def resolve_in_thread(video_id: str, force_refresh: bool = False) -> dict:
     if force_refresh:
+        if redis_client:
+            try:
+                redis_client.delete(f"ytm:{video_id}", f"ytm:err:{video_id}")
+            except Exception:
+                pass
         with cache_lock:
             cache.pop(video_id, None)
             error_cache.pop(video_id, None)
@@ -512,9 +564,12 @@ async def proxy_audio_stream(
                 client_name = data.get("client", "VISION_OS")
                 if client_name == "ANDROID_VR":
                     upstream_headers["User-Agent"] = "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+                elif client_name == "IOS_MUSIC":
+                    upstream_headers["User-Agent"] = "com.google.ios.youtubemusic/6.42 (iPhone16,2; U; CPU iOS 17_4 like Mac OS X)"
+                elif client_name == "MWEB":
+                    upstream_headers["User-Agent"] = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
                 else:
                     upstream_headers["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15"
-
                 try:
                     req = http_client.build_request(request.method, data["url"], headers=upstream_headers)
                     upstream = await http_client.send(req, stream=True)
