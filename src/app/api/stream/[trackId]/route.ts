@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { audiusProvider } from "@/music/audius/provider";
-
+import { maskStreamUrl } from "@/audio/vault";
 
 export const runtime = "nodejs";
 
@@ -194,10 +194,12 @@ export async function GET(
       return NextResponse.json({ error: "Stream unavailable" }, { status: 404 });
     }
 
+    const ticket = maskStreamUrl(streamUrl);
+
     return NextResponse.json({
       source: {
-        url: streamUrl,
-        type: "direct",
+        url: `/stream-vault/stream?id=${encodeURIComponent(providerTrackId)}&vault=${ticket}`,
+        type: "vault",
         provider,
         duration: trackDuration,
       },

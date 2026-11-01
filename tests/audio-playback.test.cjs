@@ -638,3 +638,18 @@ test('late duration response for previous track cannot set current track boundar
   assert.equal(p.manager.resolvedDuration, null);
   p.manager.pause();
 });
+test('lock-screen next at end of queue keeps session alive with silence and advances when recommendations resolve', async () => {
+  const p = player();
+  p.manager.setQueue([track('a')]);
+  p.manager.setAutoplay(true);
+  p.audio.emit('playing');
+  p.manager.next();
+  assert.ok(p.audio.src.startsWith('data:audio'));
+  assert.equal(p.state.status, 'LOADING');
+  const request = p.request();
+  assert.ok(request);
+  request.resolve({ ok: true, json: async () => ({ tracks: [track('b')] }) });
+  await flush();
+  assert.equal(p.state.currentTrack.id, 'ytm:b');
+  p.manager.pause();
+});

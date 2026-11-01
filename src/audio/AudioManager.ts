@@ -18,6 +18,7 @@ const REMOTE_PROGRESS_WAIT_MS = 5000;
 const REMOTE_NAVIGATION_COOLDOWN_MS = 450;
 const MAX_FAILED_TRACKS = 3;
 const RESUME_STORAGE_KEY = "cloudbeats_playback_resume";
+const SILENT_AUDIO = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=";
 declare global {
   interface Window {
     __cloudbeats_audio__?: HTMLAudioElement;
@@ -67,6 +68,7 @@ export class AudioManager {
   private lastSyncedSecond: number = -1;
   private lastRemoteNavigationAt = 0;
   private hasPreloadedNearEnd = false;
+  private isAwaitingReplenishAdvance = false;
 
   // Store sync hook
   private storeSync: AudioManagerStoreSync | null = null;
@@ -196,6 +198,7 @@ export class AudioManager {
     });
 
     this.audio.addEventListener("timeupdate", () => {
+      if (this.isTransitioning || !this.currentTrack || (this.audio.src && this.audio.src.startsWith("data:audio"))) return;
       if (this.checkTrackBoundary("timeupdate")) return;
       // Guard: don't overwrite position if we are applying a resume seek
       if (this.pendingSeekTime !== null) {
@@ -300,7 +303,7 @@ export class AudioManager {
     this.audio.addEventListener("ratechange", () => this.scheduleEndCheck());
 
     this.audio.addEventListener("error", () => {
-      if (!this.audio.src || this.audio.src === "" || this.audio.src === window.location.href) {
+      if (!this.audio.src || this.audio.src === "" || this.audio.src === window.location.href || this.audio.src.startsWith("data:audio")) {
         return;
       }
       const code = this.audio.error?.code;
@@ -425,6 +428,7 @@ export class AudioManager {
     this.clearEndTimer();
     this.clearRemoteProgressTimer();
     this.shouldBePlaying = false;
+    this.audio.loop = false;
     this.playRequest++;
     this.cancelPendingRecommendations();
     this.clearRecoveryTimer();
@@ -463,7 +467,6 @@ export class AudioManager {
 
   public next() {
     this.trace("control.next");
-    this.cancelPendingRecommendations();
     this.consecutiveFailures = 0;
     this.playNext(true);
   }
@@ -555,7 +558,7 @@ export class AudioManager {
   private loadAndPlayCurrentTrack(forceRefresh = false) {
     if (!this.currentTrack) return;
 
-    this.cancelPendingRecommendations();
+    this.audio.loop = false;
     this.clearRemoteProgressTimer();
     const track = this.currentTrack;
     this.clearEndTimer();
@@ -738,23 +741,35 @@ export class AudioManager {
     if (upcoming[0]) void prewarmNextTrack(upcoming[0]);
     if (upcoming[1]) void prewarmTrackMetadata(upcoming[1]);
     const remaining = this.queue.getTracks().length - this.queue.getCurrentIndex();
-    if (this.queue.isAutoplay() && remaining <= 3 && !this.recommendationRequest && Date.now() >= this.nextRecommendationAt) {
-      void this.replenishAutoplayQueue(false);
+    if (this.queue.isAutoplay() && remaining <= 5 && !this.recommendationRequest) {
+      if (remaining <= 2 || Date.now() >= this.nextRecommendationAt) {
+        void this.replenishAutoplayQueue(false);
+      }
     }
   }
 
   private handleAutoplayQueueReplenish() {
-    this.cancelPendingRecommendations();
+    this.isAwaitingReplenishAdvance = true;
     this.shouldBePlaying = true;
-    this.audio.pause();
     this.clearRecoveryTimer();
+    this.isTransitioning = true;
+    try {
+      this.audio.src = SILENT_AUDIO;
+      this.audio.loop = true;
+      void this.audio.play().catch(() => {});
+    } catch {} finally {
+      this.isTransitioning = false;
+    }
+    setMediaSessionPlaybackState("playing");
     this.syncStore({ status: "LOADING", isPlaying: false, isBuffering: true });
-    void this.replenishAutoplayQueue(true);
+    if (!this.recommendationRequest) {
+      void this.replenishAutoplayQueue(true);
+    }
   }
 
-  private async replenishAutoplayQueue(advanceWhenReady: boolean) {
+  private async replenishAutoplayQueue(advanceWhenReady = false) {
     if (!this.currentTrack || this.recommendationRequest) return;
-    const generation = this.playbackGeneration;
+    if (advanceWhenReady) this.isAwaitingReplenishAdvance = true;
     const controller = new AbortController();
     this.recommendationRequest = controller;
     this.nextRecommendationAt = Date.now() + 15000;
@@ -767,10 +782,13 @@ export class AudioManager {
       });
       if (!response.ok) throw new Error(`Recommendations HTTP ${response.status}`);
       const data = await response.json();
-      if (controller.signal.aborted || generation !== this.playbackGeneration) return;
-      this.queue.appendTracks(data.tracks || []);
-      this.syncStore({ queue: this.queue.getRawQueue() });
-      if (advanceWhenReady && this.shouldBePlaying) {
+      if (controller.signal.aborted) return;
+      if (Array.isArray(data.tracks) && data.tracks.length > 0) {
+        this.queue.appendTracks(data.tracks);
+        this.syncStore({ queue: this.queue.getRawQueue() });
+      }
+      if (this.isAwaitingReplenishAdvance && this.shouldBePlaying) {
+        this.isAwaitingReplenishAdvance = false;
         const next = this.queue.advance(true);
         if (next) {
           this.currentTrack = next;
@@ -787,10 +805,13 @@ export class AudioManager {
       clearTimeout(timeout);
       if (this.recommendationRequest === controller) this.recommendationRequest = null;
     }
-    if (advanceWhenReady && generation === this.playbackGeneration && this.shouldBePlaying && (!controller.signal.aborted || timedOut)) {
+    if (this.isAwaitingReplenishAdvance && this.shouldBePlaying && (!controller.signal.aborted || timedOut)) {
+      this.isAwaitingReplenishAdvance = false;
       this.shouldBePlaying = false;
+      this.audio.loop = false;
+      this.audio.pause();
       this.syncStore({ isPlaying: false, isBuffering: false, status: "ENDED" });
-      setMediaSessionPlaybackState("paused");
+      setMediaSessionPlaybackState("none");
     }
   }
 
@@ -852,6 +873,7 @@ export class AudioManager {
   }
 
   private cancelPendingRecommendations() {
+    this.isAwaitingReplenishAdvance = false;
     if (!this.recommendationRequest) return;
     this.recommendationRequest.abort();
     this.recommendationRequest = null;
@@ -900,7 +922,7 @@ export class AudioManager {
   }
 
   private recoverPlayback() {
-    if (!this.currentTrack || !this.shouldBePlaying) return;
+    if (!this.currentTrack || !this.shouldBePlaying || (this.audio.src && this.audio.src.startsWith("data:audio"))) return;
     this.clearRecoveryTimer();
     if (this.checkTrackBoundary("recovery")) return;
     this.trace("recovery.start", { attempt: this.recoveryAttempts });
@@ -1139,13 +1161,9 @@ export class AudioManager {
     let targetUrl: string;
     if (preparedUrl) {
       targetUrl = preparedUrl;
-    } else if (provider === "ytm") {
-      const resolverBase = (process.env.NEXT_PUBLIC_RESOLVER_URL || "https://resolver.cloudiolabs.my.id").replace(/\/+$/, "");
-      targetUrl = `${resolverBase}/stream?id=${encodeURIComponent(providerTrackId)}${forceRefresh ? "&refresh=1" : ""}`;
     } else {
-      targetUrl = `/api/stream/${encodeURIComponent(track.id)}?audio=true${forceRefresh ? "&refresh=1" : ""}`;
+      targetUrl = `/stream-vault/stream?id=${encodeURIComponent(providerTrackId)}${forceRefresh ? "&refresh=1" : ""}`;
     }
-
     if (targetUrl.startsWith("http://") || targetUrl.startsWith("https://")) {
       const ticket = maskStreamUrl(targetUrl);
       return `/stream-vault/stream?id=${encodeURIComponent(providerTrackId)}${forceRefresh ? "&refresh=1" : ""}&vault=${ticket}`;

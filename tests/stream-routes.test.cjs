@@ -104,10 +104,11 @@ test('resolve forwards refresh and exposes signed URL expiration', async () => {
   assert.equal((await result.json()).expiresAt, 12345);
 });
 
-test('metadata response returns direct stream URL', async () => {
+test('metadata response returns masked vault stream URL', async () => {
   const api = route('stream', async () => Response.json({ status: 'warmed', url: 'https://resolver.test/stream?id=abcdefghijk&exp=123', duration: 180 }));
   const result = await api.GET(request(''), params);
   const data = await result.json();
-  assert.equal(data.source.url, 'https://resolver.test/stream?id=abcdefghijk&exp=123');
+  assert.ok(data.source.url.startsWith('/stream-vault/stream?id=abcdefghijk&vault=vlt_'));
+  assert.equal(data.source.type, 'vault');
   assert.equal(data.source.duration, 180);
 });

@@ -178,8 +178,6 @@ export async function getDirectStreamUrl(
     if (preparedUrl) return preparedUrl;
   }
 
-  const resolverBase = (process.env.NEXT_PUBLIC_RESOLVER_URL || "https://resolver.cloudiolabs.my.id").replace(/\/+$/, "");
-
   try {
     const res = await fetch(`/api/resolve/${encodeURIComponent(trackId)}${forceRefresh ? "?refresh=1" : ""}`, {
       cache: "no-store",
@@ -195,8 +193,5 @@ export async function getDirectStreamUrl(
     }
   } catch {}
 
-  if (provider === "ytm") {
-    return `${resolverBase}/stream?id=${encodeURIComponent(providerTrackId)}${forceRefresh ? "&refresh=1" : ""}`;
-  }
-  return `/api/stream/${encodeURIComponent(trackId)}?audio=true${forceRefresh ? "&refresh=1" : ""}`;
+  return `/stream-vault/stream?id=${encodeURIComponent(providerTrackId)}${forceRefresh ? "&refresh=1" : ""}`;
 }

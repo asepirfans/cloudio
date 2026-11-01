@@ -43,7 +43,6 @@ const nextConfig: NextConfig = {
   ],
   env: {
     RESOLVER_SERVICE_URL: process.env.RESOLVER_SERVICE_URL || "https://resolver.cloudiolabs.my.id",
-    NEXT_PUBLIC_RESOLVER_URL: process.env.NEXT_PUBLIC_RESOLVER_URL || "https://resolver.cloudiolabs.my.id",
   },
   rewrites: async () => [
     {
